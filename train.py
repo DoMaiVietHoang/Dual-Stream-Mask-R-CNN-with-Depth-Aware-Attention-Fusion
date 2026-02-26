@@ -47,10 +47,11 @@ def train_one_epoch(
     optimizer: optim.Optimizer,
     device: torch.device,
     epoch: int,
+    accumulation_steps: int = 4,
     logger: Optional[logging.Logger] = None
 ) -> Dict[str, float]:
     """
-    Train for one epoch
+    Train for one epoch with gradient accumulation
 
     Args:
         model: DualStreamMaskRCNN model
@@ -58,13 +59,14 @@ def train_one_epoch(
         optimizer: Optimizer
         device: Device to train on
         epoch: Current epoch number
+        accumulation_steps: Number of batches to accumulate before optimizer step
         logger: Logger instance
 
     Returns:
         Dictionary of average losses
     """
     model.train()
-    
+
     total_losses = {
         'loss_classifier': 0.0,
         'loss_box_reg': 0.0,
@@ -74,9 +76,10 @@ def train_one_epoch(
         'loss_boundary': 0.0,
         'loss_total': 0.0
     }
-    
+
+    optimizer.zero_grad()
     pbar = tqdm(dataloader, desc=f'Epoch {epoch}')
-    
+
     for batch_idx, (images, targets) in enumerate(pbar):
         # Move data to device
         images = images.to(device)
@@ -87,29 +90,27 @@ def train_one_epoch(
         depth_maps = None
         if len(targets) > 0 and 'depth' in targets[0]:
             depth_maps = torch.stack([t.pop('depth') for t in targets])
-            # depth_maps shape: [B, 1, H, W], already on device
 
         # Forward pass
-        optimizer.zero_grad()
         loss_dict = model(images, targets, depth_maps=depth_maps)
 
-        # Sum standard Mask R-CNN losses
+        # Sum losses and scale by accumulation steps
         losses = sum(loss for loss in loss_dict.values())
+        scaled_loss = losses / accumulation_steps
+        scaled_loss.backward()
 
-        # Backward pass
-        losses.backward()
+        # Optimizer step every accumulation_steps batches
+        if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(dataloader):
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad()
 
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
-        optimizer.step()
-        
-        # Accumulate losses
+        # Accumulate unscaled losses for logging
         for key in loss_dict:
             if key in total_losses:
                 total_losses[key] += loss_dict[key].item()
         total_losses['loss_total'] += losses.item()
-        
+
         # Update progress bar
         pbar.set_postfix({
             'loss': f'{losses.item():.4f}',
@@ -118,19 +119,19 @@ def train_one_epoch(
             'bound': f'{loss_dict.get("loss_boundary", 0):.4f}'
         })
 
-        # Clear CUDA cache periodically to prevent memory fragmentation
+        # Clear CUDA cache periodically
         if batch_idx % 100 == 0 and batch_idx > 0:
             torch.cuda.empty_cache()
-    
+
     # Average losses
     num_batches = len(dataloader)
     avg_losses = {k: v / num_batches for k, v in total_losses.items()}
-    
+
     if logger:
         logger.info(f'Epoch {epoch} - Average losses:')
         for key, value in avg_losses.items():
             logger.info(f'  {key}: {value:.4f}')
-    
+
     return avg_losses
 
 
@@ -663,7 +664,8 @@ def main(args):
     logger.info(f'Param groups: backbone={len(backbone_params)} (lr={base_lr * backbone_lr_scale}), '
                 f'daaf={len(daaf_params)} (lr={base_lr}), heads={len(head_params)} (lr={base_lr})')
 
-    # Learning rate scheduler: warmup + cosine annealing
+    # Learning rate scheduler: warmup + multi-step decay
+    # MultiStepLR keeps LR high longer than cosine, preventing premature decay
     warmup_epochs = 3
     warmup_scheduler = optim.lr_scheduler.LinearLR(
         optimizer,
@@ -671,14 +673,14 @@ def main(args):
         end_factor=1.0,
         total_iters=warmup_epochs
     )
-    cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+    step_scheduler = optim.lr_scheduler.MultiStepLR(
         optimizer,
-        T_max=args.num_epochs - warmup_epochs,
-        eta_min=base_lr * 0.01
+        milestones=[20, 35],
+        gamma=0.1
     )
     scheduler = optim.lr_scheduler.SequentialLR(
         optimizer,
-        schedulers=[warmup_scheduler, cosine_scheduler],
+        schedulers=[warmup_scheduler, step_scheduler],
         milestones=[warmup_epochs]
     )
     
@@ -697,7 +699,10 @@ def main(args):
     
     # Training loop
     logger.info('Starting training...')
-    
+    logger.info(f'Gradient accumulation steps: {args.accumulation_steps} '
+                f'(effective batch size: {args.batch_size * args.accumulation_steps})')
+    epochs_without_improvement = 0
+
     for epoch in range(start_epoch, args.num_epochs):
         # Train
         train_losses = train_one_epoch(
@@ -706,17 +711,18 @@ def main(args):
             optimizer=optimizer,
             device=device,
             epoch=epoch,
+            accumulation_steps=args.accumulation_steps,
             logger=logger
         )
-        
+
         # Log to TensorBoard
         for key, value in train_losses.items():
             writer.add_scalar(f'train/{key}', value, epoch)
         writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], epoch)
-        
+
         # Update learning rate
         scheduler.step()
-        
+
         # Evaluate
         if (epoch + 1) % args.eval_interval == 0:
             metrics = evaluate(
@@ -726,17 +732,20 @@ def main(args):
                 logger=logger,
                 max_batches=args.max_eval_batches
             )
-            
+
             # Log to TensorBoard
             for key, value in metrics.items():
                 writer.add_scalar(f'val/{key}', value, epoch)
-            
+
             # Save checkpoint
             is_best = metrics['f1'] > best_f1
             if is_best:
                 best_f1 = metrics['f1']
+                epochs_without_improvement = 0
                 logger.info(f'New best F1: {best_f1:.4f}')
-            
+            else:
+                epochs_without_improvement += 1
+
             save_checkpoint(
                 model=model,
                 optimizer=optimizer,
@@ -745,7 +754,12 @@ def main(args):
                 output_dir=output_dir,
                 is_best=is_best
             )
-    
+
+            # Early stopping
+            if args.early_stopping_patience > 0 and epochs_without_improvement >= args.early_stopping_patience:
+                logger.info(f'Early stopping: no improvement for {args.early_stopping_patience} epochs')
+                break
+
     logger.info(f'Training complete. Best F1: {best_f1:.4f}')
     writer.close()
 
@@ -764,7 +778,7 @@ if __name__ == '__main__':
                         help='Number of classes (including background)')
     parser.add_argument('--pretrained', action='store_true', default=True,
                         help='Use pretrained backbone')
-    parser.add_argument('--lambda-boundary', type=float, default=0.5,
+    parser.add_argument('--lambda-boundary', type=float, default=1.0,
                         help='Weight for boundary loss')
     
     # Training
@@ -782,7 +796,11 @@ if __name__ == '__main__':
                         help='Number of data loading workers')
     parser.add_argument('--image-size', type=int, default=1024,
                         help='Input image size')
-    
+    parser.add_argument('--accumulation-steps', type=int, default=4,
+                        help='Gradient accumulation steps (effective batch = batch_size * steps)')
+    parser.add_argument('--early-stopping-patience', type=int, default=10,
+                        help='Stop if no F1 improvement for N epochs (0 = disabled)')
+
     # Evaluation
     parser.add_argument('--eval-interval', type=int, default=1,
                         help='Evaluation interval (epochs)')
