@@ -147,24 +147,27 @@ def evaluate(
     Evaluate model on validation set.
     Calculates P/R/F1 (box-based) and mask AP metrics (AP, AP50, AP70, AP75).
 
-    Mask AP uses pixel-level mask IoU for TP/FP matching — the correct metric
-    for instance segmentation tasks like tree crown delineation.
+    Memory-efficient design: mask IoU is computed per-batch and immediately
+    discarded. Only lightweight scalars (scores, iou_matrix rows) are kept,
+    so RAM usage is O(total_predictions) not O(total_pixels).
 
     Args:
         max_batches: Maximum number of batches to evaluate (None = all batches)
     """
     model.eval()
 
-    # For basic metrics (P/R/F1) - box-based, calculated incrementally
+    # Box-based P/R/F1 — incremental counters
     total_tp = 0
     total_fp = 0
     total_fn = 0
     total_iou = 0.0
     num_instances = 0
 
-    # For mask AP — accumulate (pred_masks, pred_scores, gt_masks) per image
-    all_predictions_seg = []
-    all_targets_seg = []
+    # For mask AP: store only (score, iou_row) per prediction — no pixel data kept
+    # iou_row[j] = mask IoU of this prediction against GT mask j of its image
+    # Structure: list of {'scores': [N], 'iou_rows': [N, M], 'num_gt': int}
+    ap_records = []   # one entry per image processed
+    total_gt_masks = 0
     num_batches_processed = 0
 
     pbar = tqdm(dataloader, desc='Evaluating')
@@ -177,12 +180,10 @@ def evaluate(
 
         images = images.to(device)
 
-        # Extract pre-computed depth maps from targets if available
         depth_maps = None
         if len(targets) > 0 and 'depth' in targets[0]:
             depth_maps = torch.stack([t['depth'] for t in targets]).to(device)
 
-        # Get predictions
         try:
             predictions = model(images, depth_maps=depth_maps)
         except Exception as e:
@@ -191,50 +192,52 @@ def evaluate(
             torch.cuda.empty_cache()
             continue
 
-        image_id_base = batch_idx * len(predictions)
-
-        for i, pred in enumerate(predictions):
-            img_id = image_id_base + i
-
-            # Binary masks: pred['masks'] is [N, 1, H, W] float in [0,1]
+        for i, (pred, target) in enumerate(zip(predictions, targets)):
+            # --- Predicted masks ---
             pred_masks_raw = pred.get('masks', None)
             if pred_masks_raw is not None and len(pred_masks_raw) > 0:
-                # Threshold to binary [N, H, W] bool, store as uint8 to save RAM
-                # bool tensor: 1 bit/pixel → uint8: 1 byte/pixel (8x more but simpler)
-                pred_masks_bin = (pred_masks_raw[:, 0] > 0.5).cpu().to(torch.uint8)
+                pred_masks = (pred_masks_raw[:, 0] > 0.5).cpu()   # [N, H, W] bool
             else:
-                pred_masks_bin = torch.zeros(
-                    (0, images.shape[2], images.shape[3]), dtype=torch.uint8
-                )
+                pred_masks = torch.zeros((0,), dtype=torch.bool)
 
-            all_predictions_seg.append({
-                'masks': pred_masks_bin,                          # [N, H, W] uint8
-                'scores': pred['scores'].detach().cpu(),          # [N]
-                'boxes': pred['boxes'].detach().cpu(),            # [N, 4] for P/R/F1
-                'image_id': img_id
+            pred_scores = pred['scores'].detach().cpu()            # [N]
+
+            # --- GT masks ---
+            gt_masks_raw = target.get('masks', None)
+            if gt_masks_raw is not None and isinstance(gt_masks_raw, torch.Tensor) and len(gt_masks_raw) > 0:
+                gt_masks = gt_masks_raw.bool().cpu()               # [M, H, W] bool
+            else:
+                gt_masks = torch.zeros((0,), dtype=torch.bool)
+
+            num_gt = len(gt_masks)
+            total_gt_masks += num_gt
+
+            # Compute mask IoU matrix [N, M] right now — release pixel data after
+            if len(pred_masks) > 0 and num_gt > 0:
+                iou_matrix = compute_mask_iou(pred_masks, gt_masks)  # [N, M] float32
+            else:
+                iou_matrix = torch.zeros((len(pred_masks), num_gt), dtype=torch.float32)
+
+            # Store only scalars: scores [N] and iou_matrix [N, M]
+            ap_records.append({
+                'scores': pred_scores,       # [N]
+                'iou_rows': iou_matrix,      # [N, M]
+                'num_gt': num_gt,
             })
 
-        for i, target in enumerate(targets):
-            img_id = image_id_base + i
-            # GT masks: [M, H, W] uint8 from dataset
-            gt_masks = target.get('masks', None)
-            if gt_masks is not None and isinstance(gt_masks, torch.Tensor):
-                gt_masks = gt_masks.to(torch.uint8).cpu()
-            else:
-                gt_masks = torch.zeros(
-                    (0, images.shape[2], images.shape[3]), dtype=torch.uint8
-                )
-            all_targets_seg.append({
-                'masks': gt_masks,                                    # [M, H, W] uint8
-                'boxes': target['boxes'].cpu(),                       # for P/R/F1
-                'image_id': img_id
-            })
+            # Free pixel tensors immediately
+            del pred_masks, gt_masks
+            if pred_masks_raw is not None:
+                del pred_masks_raw
 
-        # Box-based P/R/F1 tracking (fast, incremental)
-        batch_metrics = calculate_metrics_batch(
-            [{'boxes': p['boxes'], 'scores': p['scores']} for p in all_predictions_seg[-len(predictions):]],
-            targets
-        )
+        # Box-based P/R/F1
+        pred_for_metrics = []
+        for pred in predictions:
+            pred_for_metrics.append({
+                'boxes': pred['boxes'].detach().cpu(),
+                'scores': pred['scores'].detach().cpu(),
+            })
+        batch_metrics = calculate_metrics_batch(pred_for_metrics, targets)
         total_tp += batch_metrics['tp']
         total_fp += batch_metrics['fp']
         total_fn += batch_metrics['fn']
@@ -243,7 +246,8 @@ def evaluate(
         num_batches_processed += 1
 
         del predictions
-        torch.cuda.empty_cache() if batch_idx % 20 == 0 and batch_idx > 0 else None
+        if batch_idx % 20 == 0 and batch_idx > 0:
+            torch.cuda.empty_cache()
 
         current_precision = total_tp / (total_tp + total_fp + 1e-8)
         current_recall = total_tp / (total_tp + total_fn + 1e-8)
@@ -254,7 +258,8 @@ def evaluate(
         })
 
     if logger:
-        logger.info(f'Calculating mask AP from {num_batches_processed} batches...')
+        logger.info(f'Calculating mask AP from {num_batches_processed} batches '
+                    f'({total_gt_masks} GT masks total)...')
 
     # Basic box-based metrics
     precision = total_tp / (total_tp + total_fp + 1e-8)
@@ -262,8 +267,8 @@ def evaluate(
     f1 = 2 * precision * recall / (precision + recall + 1e-8)
     mean_iou = total_iou / (num_instances + 1e-8)
 
-    # Mask segmentation AP (pixel-level IoU)
-    ap_metrics = calculate_ap_metrics(all_predictions_seg, all_targets_seg)
+    # Mask AP from pre-computed IoU records (no pixel data needed here)
+    ap_metrics = calculate_ap_metrics(ap_records, total_gt_masks)
 
     metrics = {
         'precision': precision,
@@ -276,7 +281,7 @@ def evaluate(
         'AP70': ap_metrics['AP70'],
     }
 
-    del all_predictions_seg, all_targets_seg
+    del ap_records
     torch.cuda.empty_cache()
 
     if logger:
@@ -388,134 +393,104 @@ def compute_mask_iou(pred_masks: torch.Tensor, gt_masks: torch.Tensor) -> torch.
 
 
 def calculate_ap_metrics(
-    predictions: List[Dict],
-    targets: List[Dict]
+    ap_records: List[Dict],
+    total_gt_masks: int
 ) -> Dict[str, float]:
     """
-    Calculate mask segmentation AP metrics (AP, AP50, AP70, AP75).
+    Calculate mask segmentation AP metrics from pre-computed IoU records.
 
-    IoU is computed at the pixel level between predicted binary masks and
-    ground-truth binary masks — the correct metric for instance segmentation.
+    ap_records is a list of per-image dicts:
+        {'scores': Tensor[N], 'iou_rows': Tensor[N, M], 'num_gt': int}
+    where iou_rows[i, j] = pixel-level mask IoU of pred i vs GT mask j.
+    This avoids storing any pixel data after the evaluation loop.
 
     Args:
-        predictions: List of dicts with 'masks' [N,H,W], 'scores' [N], 'image_id'
-        targets:     List of dicts with 'masks' [M,H,W], 'image_id'
+        ap_records:     One dict per image, already computed during eval loop
+        total_gt_masks: Total number of GT masks across all images
 
     Returns:
         Dict with AP, AP50, AP70, AP75 values
     """
-    # Group by image_id and concatenate masks/scores (handles batch_size>1)
-    pred_by_image: Dict = {}
-    for pred in predictions:
-        img_id = pred['image_id']
-        if img_id not in pred_by_image:
-            pred_by_image[img_id] = {'masks': [], 'scores': []}
-        if len(pred['masks']) > 0:
-            pred_by_image[img_id]['masks'].append(pred['masks'])
-            pred_by_image[img_id]['scores'].append(pred['scores'])
-
-    for img_id in pred_by_image:
-        masks_list = pred_by_image[img_id]['masks']
-        scores_list = pred_by_image[img_id]['scores']
-        pred_by_image[img_id]['masks'] = (
-            torch.cat(masks_list, dim=0) if masks_list
-            else torch.zeros((0,), dtype=torch.bool)
-        )
-        pred_by_image[img_id]['scores'] = (
-            torch.cat(scores_list, dim=0) if scores_list
-            else torch.zeros(0)
-        )
-
-    target_by_image: Dict = {}
-    for target in targets:
-        img_id = target['image_id']
-        target_by_image[img_id] = target
-
     coco_thresholds = [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
 
     ap_results = {}
-    ap_results['AP50'] = calculate_ap_at_iou(pred_by_image, target_by_image, 0.5)
-    ap_results['AP75'] = calculate_ap_at_iou(pred_by_image, target_by_image, 0.75)
-    ap_results['AP70'] = calculate_ap_at_iou(pred_by_image, target_by_image, 0.7)
-    ap_values = [calculate_ap_at_iou(pred_by_image, target_by_image, t) for t in coco_thresholds]
+    ap_results['AP50'] = calculate_ap_at_iou(ap_records, total_gt_masks, 0.5)
+    ap_results['AP75'] = calculate_ap_at_iou(ap_records, total_gt_masks, 0.75)
+    ap_results['AP70'] = calculate_ap_at_iou(ap_records, total_gt_masks, 0.7)
+    ap_values = [calculate_ap_at_iou(ap_records, total_gt_masks, t) for t in coco_thresholds]
     ap_results['AP'] = sum(ap_values) / len(ap_values)
 
     return ap_results
 
 
 def calculate_ap_at_iou(
-    pred_by_image: Dict,
-    target_by_image: Dict,
+    ap_records: List[Dict],
+    total_gt: int,
     iou_threshold: float
 ) -> float:
     """
     Calculate mask AP at a specific IoU threshold using 101-point AUC interpolation.
 
+    Memory-efficient: works from pre-computed IoU matrices (scalars only),
+    no pixel tensors required.
+
     Protocol (COCO-style):
-    - All predicted masks are sorted globally by confidence score descending
-    - Each prediction is matched to the unmatched GT mask with the highest
-      pixel-level mask IoU; if IoU >= threshold it is a TP, otherwise FP
-    - AP = area under the precision-recall curve (101-point interpolation)
+    - All predictions across all images sorted by score descending
+    - Greedy matching: each prediction claims the highest-IoU unmatched GT
+    - TP if best_iou >= iou_threshold, FP otherwise
+    - AP = 101-point interpolation of the P-R curve
 
     Args:
-        pred_by_image: {img_id: {'masks': Tensor[N,H,W], 'scores': Tensor[N]}}
-        target_by_image: {img_id: {'masks': Tensor[M,H,W]}}
-        iou_threshold: mask IoU threshold for TP matching
+        ap_records:    List of {'scores': [N], 'iou_rows': [N, M], 'num_gt': int}
+        total_gt:      Total GT masks across all images
+        iou_threshold: Mask IoU threshold for TP/FP
 
     Returns:
         AP value in [0, 1]
     """
-    # Flatten all predictions into parallel lists
-    all_pred_masks = []
-    all_pred_scores = []
-    all_pred_image_ids = []
-
-    for img_id, pred in pred_by_image.items():
-        masks = pred['masks']
-        scores = pred['scores']
-        if len(masks) == 0:
-            continue
-        for i in range(len(masks)):
-            all_pred_masks.append(masks[i])        # [H, W] bool
-            all_pred_scores.append(scores[i].item())
-            all_pred_image_ids.append(img_id)
-
-    if len(all_pred_masks) == 0:
-        return 0.0
-
-    total_gt = sum(len(t['masks']) for t in target_by_image.values())
     if total_gt == 0:
         return 0.0
 
-    # Sort by confidence descending
-    order = sorted(range(len(all_pred_scores)),
-                   key=lambda i: all_pred_scores[i], reverse=True)
+    # Build flat lists: (score, image_record_idx, pred_idx_within_image)
+    all_scores = []
+    all_record_idx = []
+    all_pred_idx = []
 
-    gt_matched = {img_id: torch.zeros(len(t['masks']), dtype=torch.bool)
-                  for img_id, t in target_by_image.items()}
+    for rec_idx, rec in enumerate(ap_records):
+        scores = rec['scores']
+        for pred_i in range(len(scores)):
+            all_scores.append(scores[pred_i].item())
+            all_record_idx.append(rec_idx)
+            all_pred_idx.append(pred_i)
+
+    if len(all_scores) == 0:
+        return 0.0
+
+    # Sort by score descending
+    order = sorted(range(len(all_scores)),
+                   key=lambda i: all_scores[i], reverse=True)
+
+    # Per-image GT match tracking (one bool vector per record)
+    gt_matched = [torch.zeros(rec['num_gt'], dtype=torch.bool) for rec in ap_records]
 
     tp = []
     fp = []
 
     for idx in order:
-        img_id = all_pred_image_ids[idx]
+        rec_idx = all_record_idx[idx]
+        pred_i = all_pred_idx[idx]
+        rec = ap_records[rec_idx]
 
-        if img_id not in target_by_image:
+        num_gt = rec['num_gt']
+        if num_gt == 0:
             fp.append(1); tp.append(0)
             continue
 
-        gt_masks = target_by_image[img_id]['masks']
-        if len(gt_masks) == 0:
-            fp.append(1); tp.append(0)
-            continue
+        # iou_rows[pred_i] is the IoU of this prediction against all GT masks
+        iou_vals = rec['iou_rows'][pred_i].clone()   # [M], float32
 
-        pred_mask = all_pred_masks[idx].unsqueeze(0)  # [1, H, W]
-
-        # Compute IoU between this single prediction and all GT masks of this image
-        iou_vals = compute_mask_iou(pred_mask, gt_masks)[0]  # [M]
-
-        # Exclude already-matched GT masks
-        iou_vals[gt_matched[img_id]] = -1.0
+        # Mask already-matched GT slots
+        iou_vals[gt_matched[rec_idx]] = -1.0
 
         best_iou, best_j = iou_vals.max(0)
         best_iou = best_iou.item()
@@ -523,7 +498,7 @@ def calculate_ap_at_iou(
 
         if best_iou >= iou_threshold:
             tp.append(1); fp.append(0)
-            gt_matched[img_id][best_j] = True
+            gt_matched[rec_idx][best_j] = True
         else:
             tp.append(0); fp.append(1)
 
@@ -537,7 +512,7 @@ def calculate_ap_at_iou(
     recalls = torch.cat([torch.zeros(1), recalls])
     precisions = torch.cat([torch.ones(1), precisions])
 
-    # 101-point interpolation (COCO-style AUC)
+    # 101-point AUC (COCO-style)
     ap = 0.0
     for t in torch.linspace(0, 1, 101):
         mask = recalls >= t
