@@ -332,10 +332,12 @@ class DualStreamMaskRCNN(nn.Module):
             out_channels=out_channels
         )
         
-        # Anchor generator
+        # Anchor generator tuned for tree crown detection on 1024x1024 aerial images.
+        # Tree crowns are roughly circular (aspect ratio ~1.0) and span 32-256px.
+        # Removing extreme anchors (512px) reduces false proposals on background.
         if rpn_anchor_generator is None:
-            anchor_sizes = ((32,), (64,), (128,), (256,), (512,))
-            aspect_ratios = ((0.5, 1.0, 2.0),) * len(anchor_sizes)
+            anchor_sizes = ((32,), (64,), (96,), (128,), (256,))
+            aspect_ratios = ((0.75, 1.0, 1.33),) * len(anchor_sizes)
             rpn_anchor_generator = AnchorGenerator(anchor_sizes, aspect_ratios)
         
         # RPN head
@@ -627,12 +629,12 @@ def build_model(
 ) -> DualStreamMaskRCNN:
     """
     Build Dual-Stream Mask R-CNN model
-    
+
     Args:
         num_classes: Number of classes (including background)
         pretrained: Whether to use pretrained backbone
         lambda_boundary: Weight for boundary loss
-        
+
     Returns:
         model: DualStreamMaskRCNN instance
     """
@@ -643,6 +645,13 @@ def build_model(
         # For 1024x1024 images
         min_size=1024,
         max_size=1024,
+        # Higher NMS threshold so touching crowns are not suppressed (default 0.5)
+        box_nms_thresh=0.6,
+        # More detections per image — dense canopy can have 200+ crowns per tile
+        box_detections_per_img=300,
+        # More RPN proposals kept after NMS so small/overlapping crowns survive
+        rpn_post_nms_top_n_train=3000,
+        rpn_post_nms_top_n_test=1500,
     )
-    
+
     return model
