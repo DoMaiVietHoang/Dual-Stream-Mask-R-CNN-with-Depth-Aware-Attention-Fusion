@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Dict, List, Optional
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -193,30 +194,72 @@ def evaluate(
             continue
 
         for i, (pred, target) in enumerate(zip(predictions, targets)):
-            # --- Predicted masks ---
-            pred_masks_raw = pred.get('masks', None)
-            if pred_masks_raw is not None and len(pred_masks_raw) > 0:
-                pred_masks = (pred_masks_raw[:, 0] > 0.5).cpu()   # [N, H, W] bool
-            else:
-                pred_masks = torch.zeros((0,), dtype=torch.bool)
-
-            pred_scores = pred['scores'].detach().cpu()            # [N]
-
-            # --- GT masks ---
+            # --- GT masks (reference size) ---
             gt_masks_raw = target.get('masks', None)
             if gt_masks_raw is not None and isinstance(gt_masks_raw, torch.Tensor) and len(gt_masks_raw) > 0:
-                gt_masks = gt_masks_raw.bool().cpu()               # [M, H, W] bool
+                gt_masks = gt_masks_raw.bool().cpu()               # [M, H_gt, W_gt] bool
             else:
                 gt_masks = torch.zeros((0,), dtype=torch.bool)
 
             num_gt = len(gt_masks)
             total_gt_masks += num_gt
 
+            # --- Predicted masks ---
+            # postprocess() resized masks to original_image_sizes which may differ
+            # from GT mask size (1024×1024 from dataset). Resize pred masks to match GT.
+            pred_masks_raw = pred.get('masks', None)
+            pred_scores = pred['scores'].detach().cpu()            # [N]
+
+            if pred_masks_raw is not None and len(pred_masks_raw) > 0:
+                # pred_masks_raw is already bool after postprocess (> 0.5 thresholded)
+                # Convert to float for interpolation
+                pred_masks_float = pred_masks_raw[:, 0].float().cpu()  # [N, H_pred, W_pred]
+
+                if num_gt > 0:
+                    gt_h, gt_w = gt_masks.shape[-2], gt_masks.shape[-1]
+                    pred_h, pred_w = pred_masks_float.shape[-2], pred_masks_float.shape[-1]
+
+                    if (pred_h, pred_w) != (gt_h, gt_w):
+                        # Resize pred masks to match GT spatial size.
+                        # This happens when original_image_sizes != image_size
+                        # (postprocess upsizes to orig, GT is always image_size).
+                        if batch_idx == 0 and i == 0 and logger:
+                            logger.info(
+                                f'[eval] Resizing pred masks {(pred_h, pred_w)} -> '
+                                f'{(gt_h, gt_w)} to match GT'
+                            )
+                        pred_masks_float = F.interpolate(
+                            pred_masks_float.unsqueeze(0),  # [1, N, H, W]
+                            size=(gt_h, gt_w),
+                            mode='bilinear',
+                            align_corners=False
+                        ).squeeze(0)  # [N, gt_h, gt_w]
+
+                pred_masks = pred_masks_float > 0.5   # [N, H_gt, W_gt] bool
+                del pred_masks_float
+            else:
+                pred_masks = torch.zeros((0,), dtype=torch.bool)
+
             # Compute mask IoU matrix [N, M] right now — release pixel data after
             if len(pred_masks) > 0 and num_gt > 0:
                 iou_matrix = compute_mask_iou(pred_masks, gt_masks)  # [N, M] float32
             else:
-                iou_matrix = torch.zeros((len(pred_masks), num_gt), dtype=torch.float32)
+                iou_matrix = torch.zeros((len(pred_scores), num_gt), dtype=torch.float32)
+
+            # Debug: log first batch stats to diagnose AP issues
+            if batch_idx == 0 and i == 0 and logger:
+                n_pred = len(pred_scores)
+                score_str = (f'[{pred_scores.min().item():.3f}, {pred_scores.max().item():.3f}]'
+                             if n_pred > 0 else 'N/A')
+                iou_str = (f'shape={tuple(iou_matrix.shape)}, '
+                           f'max={iou_matrix.max().item():.4f}, '
+                           f'mean={iou_matrix.mean().item():.4f}'
+                           if iou_matrix.numel() > 0 else 'empty')
+                logger.info(
+                    f'[eval-debug] batch0/img0: '
+                    f'num_pred={n_pred}, num_gt={num_gt}, '
+                    f'scores={score_str}, iou_matrix={iou_str}'
+                )
 
             # Store only scalars: scores [N] and iou_matrix [N, M]
             ap_records.append({
@@ -260,6 +303,21 @@ def evaluate(
     if logger:
         logger.info(f'Calculating mask AP from {num_batches_processed} batches '
                     f'({total_gt_masks} GT masks total)...')
+        # Debug: summarize ap_records to diagnose AP=0.0099 issue
+        total_preds = sum(len(r['scores']) for r in ap_records)
+        records_with_preds = sum(1 for r in ap_records if len(r['scores']) > 0)
+        records_with_gt = sum(1 for r in ap_records if r['num_gt'] > 0)
+        iou_max_overall = max(
+            (r['iou_rows'].max().item() for r in ap_records if r['iou_rows'].numel() > 0),
+            default=0.0
+        )
+        logger.info(
+            f'[eval-debug] ap_records summary: '
+            f'{len(ap_records)} images, {total_preds} total preds, '
+            f'{records_with_preds} images have preds, '
+            f'{records_with_gt} images have GT, '
+            f'max IoU across all pairs = {iou_max_overall:.4f}'
+        )
 
     # Basic box-based metrics
     precision = total_tp / (total_tp + total_fp + 1e-8)
