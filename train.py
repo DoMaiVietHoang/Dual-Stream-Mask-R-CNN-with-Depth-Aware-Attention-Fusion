@@ -26,6 +26,29 @@ from modules.losses import BoundaryLoss, TreeCrownSegmentationLoss
 from config import Config
 
 
+class ModelEMA:
+    """Exponential Moving Average of model weights for stable evaluation."""
+
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        import copy
+        self.ema_model = copy.deepcopy(model)
+        self.ema_model.eval()
+        self.decay = decay
+        for p in self.ema_model.parameters():
+            p.requires_grad_(False)
+
+    def update(self, model: nn.Module):
+        with torch.no_grad():
+            for ema_p, model_p in zip(self.ema_model.parameters(), model.parameters()):
+                ema_p.data.mul_(self.decay).add_(model_p.data, alpha=1 - self.decay)
+
+    def state_dict(self):
+        return self.ema_model.state_dict()
+
+    def load_state_dict(self, state_dict):
+        self.ema_model.load_state_dict(state_dict)
+
+
 def setup_logging(output_dir: str) -> logging.Logger:
     """Setup logging configuration"""
     os.makedirs(output_dir, exist_ok=True)
@@ -257,9 +280,9 @@ def evaluate(
             else:
                 pred_masks = torch.zeros((0,), dtype=torch.bool)
 
-            # Compute mask IoU matrix [N, M] right now — release pixel data after
+            # Compute mask IoU matrix [N, M] on GPU for speed
             if len(pred_masks) > 0 and num_gt > 0:
-                iou_matrix = compute_mask_iou(pred_masks, gt_masks)  # [N, M] float32
+                iou_matrix = compute_mask_iou(pred_masks, gt_masks, device=device)
             else:
                 iou_matrix = torch.zeros((len(pred_scores), num_gt), dtype=torch.float32)
 
@@ -434,16 +457,22 @@ def calculate_metrics_batch(
     }
 
 
-def compute_mask_iou(pred_masks: torch.Tensor, gt_masks: torch.Tensor) -> torch.Tensor:
+def compute_mask_iou(
+    pred_masks: torch.Tensor,
+    gt_masks: torch.Tensor,
+    device: Optional[torch.device] = None
+) -> torch.Tensor:
     """
     Compute pixel-level IoU between N predicted masks and M ground-truth masks.
+    Uses GPU if available for large matrix operations.
 
     Args:
         pred_masks: [N, H, W] bool tensor
         gt_masks:   [M, H, W] bool tensor
+        device:     GPU device for acceleration (None = CPU)
 
     Returns:
-        iou_matrix: [N, M] float tensor, each entry is mask IoU between pred i and gt j
+        iou_matrix: [N, M] float tensor on CPU
     """
     N = pred_masks.shape[0]
     M = gt_masks.shape[0]
@@ -451,20 +480,23 @@ def compute_mask_iou(pred_masks: torch.Tensor, gt_masks: torch.Tensor) -> torch.
     if N == 0 or M == 0:
         return torch.zeros((N, M), dtype=torch.float32)
 
-    # Flatten to [N, H*W] and [M, H*W]
-    pred_flat = pred_masks.view(N, -1).float()   # [N, HW]
-    gt_flat = gt_masks.view(M, -1).float()       # [M, HW]
+    # Move to GPU for fast matrix multiply
+    if device is not None and device.type == 'cuda':
+        pred_flat = pred_masks.view(N, -1).float().to(device)
+        gt_flat = gt_masks.view(M, -1).float().to(device)
+    else:
+        pred_flat = pred_masks.view(N, -1).float()
+        gt_flat = gt_masks.view(M, -1).float()
 
-    # intersection[i, j] = sum(pred_i AND gt_j)
-    intersection = torch.mm(pred_flat, gt_flat.t())  # [N, M]
+    intersection = torch.mm(pred_flat, gt_flat.t())
 
-    pred_area = pred_flat.sum(dim=1, keepdim=True)   # [N, 1]
-    gt_area = gt_flat.sum(dim=1, keepdim=True)       # [M, 1]
+    pred_area = pred_flat.sum(dim=1, keepdim=True)
+    gt_area = gt_flat.sum(dim=1, keepdim=True)
 
-    union = pred_area + gt_area.t() - intersection   # [N, M]
+    union = pred_area + gt_area.t() - intersection
 
     iou_matrix = intersection / (union + 1e-8)
-    return iou_matrix
+    return iou_matrix.cpu()
 
 
 def calculate_ap_metrics(
@@ -472,129 +504,101 @@ def calculate_ap_metrics(
     total_gt_masks: int
 ) -> Dict[str, float]:
     """
-    Calculate mask segmentation AP metrics from pre-computed IoU records.
+    Calculate mask AP at multiple IoU thresholds in a single pass.
 
-    ap_records is a list of per-image dicts:
-        {'scores': Tensor[N], 'iou_rows': Tensor[N, M], 'num_gt': int}
-    where iou_rows[i, j] = pixel-level mask IoU of pred i vs GT mask j.
-    This avoids storing any pixel data after the evaluation loop.
-
-    Args:
-        ap_records:     One dict per image, already computed during eval loop
-        total_gt_masks: Total number of GT masks across all images
-
-    Returns:
-        Dict with AP, AP50, AP70, AP75 values
+    Instead of sorting and matching 13 times independently, we sort once
+    and record per-prediction best IoU, then compute AP for each threshold.
     """
+    if total_gt_masks == 0:
+        return {'AP': 0.0, 'AP50': 0.0, 'AP75': 0.0, 'AP70': 0.0}
+
     coco_thresholds = [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
+    all_thresholds = sorted(set(coco_thresholds + [0.7]))  # include AP70
 
-    ap_results = {}
-    ap_results['AP50'] = calculate_ap_at_iou(ap_records, total_gt_masks, 0.5)
-    ap_results['AP75'] = calculate_ap_at_iou(ap_records, total_gt_masks, 0.75)
-    ap_results['AP70'] = calculate_ap_at_iou(ap_records, total_gt_masks, 0.7)
-    ap_values = [calculate_ap_at_iou(ap_records, total_gt_masks, t) for t in coco_thresholds]
-    ap_results['AP'] = sum(ap_values) / len(ap_values)
-
-    return ap_results
-
-
-def calculate_ap_at_iou(
-    ap_records: List[Dict],
-    total_gt: int,
-    iou_threshold: float
-) -> float:
-    """
-    Calculate mask AP at a specific IoU threshold using 101-point AUC interpolation.
-
-    Memory-efficient: works from pre-computed IoU matrices (scalars only),
-    no pixel tensors required.
-
-    Protocol (COCO-style):
-    - All predictions across all images sorted by score descending
-    - Greedy matching: each prediction claims the highest-IoU unmatched GT
-    - TP if best_iou >= iou_threshold, FP otherwise
-    - AP = 101-point interpolation of the P-R curve
-
-    Args:
-        ap_records:    List of {'scores': [N], 'iou_rows': [N, M], 'num_gt': int}
-        total_gt:      Total GT masks across all images
-        iou_threshold: Mask IoU threshold for TP/FP
-
-    Returns:
-        AP value in [0, 1]
-    """
-    if total_gt == 0:
-        return 0.0
-
-    # Build flat lists: (score, image_record_idx, pred_idx_within_image)
+    # Build flat arrays
     all_scores = []
     all_record_idx = []
     all_pred_idx = []
 
     for rec_idx, rec in enumerate(ap_records):
-        scores = rec['scores']
-        for pred_i in range(len(scores)):
-            all_scores.append(scores[pred_i].item())
-            all_record_idx.append(rec_idx)
-            all_pred_idx.append(pred_i)
+        n = len(rec['scores'])
+        if n > 0:
+            for pred_i in range(n):
+                all_scores.append(rec['scores'][pred_i].item())
+                all_record_idx.append(rec_idx)
+                all_pred_idx.append(pred_i)
 
     if len(all_scores) == 0:
-        return 0.0
+        return {'AP': 0.0, 'AP50': 0.0, 'AP75': 0.0, 'AP70': 0.0}
 
-    # Sort by score descending
+    # Sort by score descending (once)
     order = sorted(range(len(all_scores)),
                    key=lambda i: all_scores[i], reverse=True)
 
-    # Per-image GT match tracking (one bool vector per record)
-    gt_matched = [torch.zeros(rec['num_gt'], dtype=torch.bool) for rec in ap_records]
+    # For each threshold, maintain independent GT match tracking
+    gt_matched = {}
+    for t in all_thresholds:
+        gt_matched[t] = [torch.zeros(rec['num_gt'], dtype=torch.bool)
+                         for rec in ap_records]
 
-    tp = []
-    fp = []
+    # best_iou[idx] for each prediction in sorted order
+    # We need per-threshold TP/FP
+    tp_lists = {t: [] for t in all_thresholds}
+    fp_lists = {t: [] for t in all_thresholds}
 
     for idx in order:
         rec_idx = all_record_idx[idx]
         pred_i = all_pred_idx[idx]
         rec = ap_records[rec_idx]
-
         num_gt = rec['num_gt']
+
         if num_gt == 0:
-            fp.append(1); tp.append(0)
+            for t in all_thresholds:
+                tp_lists[t].append(0)
+                fp_lists[t].append(1)
             continue
 
-        # iou_rows[pred_i] is the IoU of this prediction against all GT masks
-        iou_vals = rec['iou_rows'][pred_i].clone()   # [M], float32
+        iou_row = rec['iou_rows'][pred_i]  # [M]
 
-        # Mask already-matched GT slots
-        iou_vals[gt_matched[rec_idx]] = -1.0
+        for t in all_thresholds:
+            iou_vals = iou_row.clone()
+            iou_vals[gt_matched[t][rec_idx]] = -1.0
+            best_iou, best_j = iou_vals.max(0)
 
-        best_iou, best_j = iou_vals.max(0)
-        best_iou = best_iou.item()
-        best_j = best_j.item()
+            if best_iou.item() >= t:
+                tp_lists[t].append(1)
+                fp_lists[t].append(0)
+                gt_matched[t][rec_idx][best_j.item()] = True
+            else:
+                tp_lists[t].append(0)
+                fp_lists[t].append(1)
 
-        if best_iou >= iou_threshold:
-            tp.append(1); fp.append(0)
-            gt_matched[rec_idx][best_j] = True
-        else:
-            tp.append(0); fp.append(1)
+    # Compute AP for each threshold
+    recall_points = torch.linspace(0, 1, 101)
+    ap_per_threshold = {}
 
-    tp_cumsum = torch.tensor(tp, dtype=torch.float32).cumsum(0)
-    fp_cumsum = torch.tensor(fp, dtype=torch.float32).cumsum(0)
+    for t in all_thresholds:
+        tp_cum = torch.tensor(tp_lists[t], dtype=torch.float32).cumsum(0)
+        fp_cum = torch.tensor(fp_lists[t], dtype=torch.float32).cumsum(0)
 
-    recalls = tp_cumsum / total_gt
-    precisions = tp_cumsum / (tp_cumsum + fp_cumsum + 1e-8)
+        recalls = torch.cat([torch.zeros(1), tp_cum / total_gt_masks])
+        precisions = torch.cat([torch.ones(1), tp_cum / (tp_cum + fp_cum + 1e-8)])
 
-    # Prepend sentinel (recall=0, precision=1)
-    recalls = torch.cat([torch.zeros(1), recalls])
-    precisions = torch.cat([torch.ones(1), precisions])
+        # 101-point interpolated AP
+        ap = 0.0
+        for rp in recall_points:
+            mask = recalls >= rp
+            ap += precisions[mask].max().item() if mask.any() else 0.0
+        ap_per_threshold[t] = ap / 101.0
 
-    # 101-point AUC (COCO-style)
-    ap = 0.0
-    for t in torch.linspace(0, 1, 101):
-        mask = recalls >= t
-        ap += precisions[mask].max().item() if mask.any() else 0.0
-    ap /= 101.0
+    coco_ap = sum(ap_per_threshold[t] for t in coco_thresholds) / len(coco_thresholds)
 
-    return ap
+    return {
+        'AP': coco_ap,
+        'AP50': ap_per_threshold[0.5],
+        'AP75': ap_per_threshold[0.75],
+        'AP70': ap_per_threshold[0.7],
+    }
 
 
 def calculate_single_iou(box1: torch.Tensor, box2: torch.Tensor) -> float:
@@ -781,6 +785,10 @@ def main(args):
         if 'metrics' in checkpoint:
             best_f1 = checkpoint['metrics'].get('f1', 0.0)
     
+    # Model EMA for stable evaluation
+    ema = ModelEMA(model, decay=0.999)
+    logger.info('Model EMA initialized (decay=0.999)')
+
     # Training loop
     logger.info('Starting training...')
     logger.info(f'Gradient accumulation steps: {args.accumulation_steps} '
@@ -800,6 +808,9 @@ def main(args):
             logger=logger
         )
 
+        # Update EMA weights
+        ema.update(model)
+
         # Log to TensorBoard
         for key, value in train_losses.items():
             writer.add_scalar(f'train/{key}', value, epoch)
@@ -808,10 +819,10 @@ def main(args):
         # Update learning rate
         scheduler.step()
 
-        # Evaluate
+        # Evaluate using EMA model for stable metrics
         if (epoch + 1) % args.eval_interval == 0:
             metrics = evaluate(
-                model=model,
+                model=ema.ema_model,
                 dataloader=val_loader,
                 device=device,
                 logger=logger,
@@ -835,7 +846,7 @@ def main(args):
                 epochs_without_improvement += 1
 
             save_checkpoint(
-                model=model,
+                model=ema.ema_model,
                 optimizer=optimizer,
                 epoch=epoch,
                 metrics=metrics,

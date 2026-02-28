@@ -393,11 +393,11 @@ class DualStreamMaskRCNN(nn.Module):
                 num_classes
             )
         
-        # Mask ROI pooling
+        # Mask ROI pooling — 28×28 for higher mask resolution
         if mask_roi_pool is None:
             mask_roi_pool = MultiScaleRoIAlign(
                 featmap_names=['0', '1', '2', '3'],
-                output_size=14,
+                output_size=28,
                 sampling_ratio=2
             )
         
@@ -598,35 +598,66 @@ class FastRCNNPredictor(nn.Module):
         return scores, bbox_deltas
 
 
-class MaskRCNNHeads(nn.Sequential):
-    """Mask head with conv layers"""
+class MaskRCNNHeads(nn.Module):
+    """Enhanced mask head with residual connections for better spatial refinement.
+
+    Architecture: 4 conv blocks with a residual shortcut every 2 layers,
+    operating at 28×28 (from mask_roi_pool output_size=28).
+    """
+
     def __init__(self, in_channels, layers, dilation):
-        d = OrderedDict()
+        super().__init__()
+        self.blocks = nn.ModuleList()
         next_feature = in_channels
         for layer_idx, layer_features in enumerate(layers):
-            d[f'mask_fcn{layer_idx + 1}'] = nn.Conv2d(
-                next_feature, layer_features, 3, padding=dilation, dilation=dilation
-            )
-            d[f'relu{layer_idx + 1}'] = nn.ReLU(inplace=True)
+            self.blocks.append(nn.Sequential(
+                nn.Conv2d(next_feature, layer_features, 3,
+                          padding=dilation, dilation=dilation),
+                nn.BatchNorm2d(layer_features),
+                nn.ReLU(inplace=True),
+            ))
             next_feature = layer_features
-        super().__init__(d)
-        
-        for name, param in self.named_parameters():
-            if 'weight' in name:
-                nn.init.kaiming_normal_(param, mode='fan_out', nonlinearity='relu')
+
+        # 1×1 projections for residual shortcuts (every 2 layers)
+        self.shortcut_01 = nn.Conv2d(in_channels, layers[1], 1) if in_channels != layers[1] else nn.Identity()
+        self.shortcut_23 = nn.Conv2d(layers[1], layers[3], 1) if layers[1] != layers[3] else nn.Identity()
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        identity = x
+        x = self.blocks[0](x)
+        x = self.blocks[1](x)
+        x = x + self.shortcut_01(identity)  # residual after block 0-1
+
+        identity = x
+        x = self.blocks[2](x)
+        x = self.blocks[3](x)
+        x = x + self.shortcut_23(identity)  # residual after block 2-3
+        return x
 
 
 class MaskRCNNPredictor(nn.Sequential):
-    """Mask predictor"""
+    """Mask predictor with 2-step upsampling for higher resolution output.
+
+    28×28 → 56×56 (deconv) → 56×56 (logits)
+    """
+
     def __init__(self, in_channels, dim_reduced, num_classes):
         super().__init__(OrderedDict([
             ('conv5_mask', nn.ConvTranspose2d(in_channels, dim_reduced, 2, 2, 0)),
+            ('bn5', nn.BatchNorm2d(dim_reduced)),
             ('relu', nn.ReLU(inplace=True)),
             ('mask_fcn_logits', nn.Conv2d(dim_reduced, num_classes, 1, 1, 0)),
         ]))
-        
+
         for name, param in self.named_parameters():
-            if 'weight' in name:
+            if 'weight' in name and 'bn' not in name:
                 nn.init.kaiming_normal_(param, mode='fan_out', nonlinearity='relu')
 
 
@@ -653,10 +684,10 @@ def build_model(
         # For 1024x1024 images
         min_size=1024,
         max_size=1024,
-        # Higher NMS threshold so touching crowns are not suppressed (default 0.5)
-        box_nms_thresh=0.6,
-        # More detections per image — dense canopy can have 200+ crowns per tile
-        box_detections_per_img=300,
+        # NMS threshold: balance between separating touching crowns and reducing FP
+        box_nms_thresh=0.5,
+        # Max detections per image — typical dense tiles have ~30-50 crowns
+        box_detections_per_img=100,
         # More RPN proposals kept after NMS so small/overlapping crowns survive
         rpn_post_nms_top_n_train=3000,
         rpn_post_nms_top_n_test=1500,
