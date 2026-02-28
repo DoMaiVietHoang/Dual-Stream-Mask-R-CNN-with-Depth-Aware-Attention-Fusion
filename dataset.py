@@ -152,26 +152,23 @@ class TreeCrownDataset(Dataset):
         """
         if self.use_augmentation:
             return A.Compose([
-                # Multi-scale training: resize to random scale then crop back
-                A.RandomScale(scale_limit=(-0.3, 0.5), p=0.5),
-                A.PadIfNeeded(min_height=self.image_size, min_width=self.image_size,
-                              border_mode=cv2.BORDER_CONSTANT, value=0),
-                A.RandomCrop(height=self.image_size, width=self.image_size, p=1.0),
+                # Always resize to target size first, then apply augmentations
+                A.Resize(self.image_size, self.image_size),
                 # Geometric augmentations
                 A.HorizontalFlip(p=0.5),
                 A.VerticalFlip(p=0.5),
                 A.RandomRotate90(p=0.5),
-                A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0, rotate_limit=15,
+                A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.1, rotate_limit=15,
                                    border_mode=cv2.BORDER_CONSTANT, value=0, p=0.5),
                 # Color augmentations
                 A.OneOf([
-                    A.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
-                    A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3),
+                    A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+                    A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2),
                 ], p=0.5),
                 A.OneOf([
                     A.GaussNoise(p=1.0),
                     A.GaussianBlur(blur_limit=(3, 7)),
-                ], p=0.3),
+                ], p=0.2),
                 ToTensorV2()
             ], bbox_params=A.BboxParams(
                 format='pascal_voc',
@@ -415,26 +412,23 @@ class TreeCrownDatasetWithDepth(TreeCrownDataset):
         """
         if self.use_augmentation:
             return A.Compose([
-                # Multi-scale training: resize to random scale then crop back
-                A.RandomScale(scale_limit=(-0.3, 0.5), p=0.5),
-                A.PadIfNeeded(min_height=self.image_size, min_width=self.image_size,
-                              border_mode=cv2.BORDER_CONSTANT, value=0),
-                A.RandomCrop(height=self.image_size, width=self.image_size, p=1.0),
+                # Always resize to target size first, then apply augmentations
+                A.Resize(self.image_size, self.image_size),
                 # Geometric augmentations
                 A.HorizontalFlip(p=0.5),
                 A.VerticalFlip(p=0.5),
                 A.RandomRotate90(p=0.5),
-                A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0, rotate_limit=15,
+                A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.1, rotate_limit=15,
                                    border_mode=cv2.BORDER_CONSTANT, value=0, p=0.5),
                 # Color augmentations (RGB only, depth registered as 'mask' type)
                 A.OneOf([
-                    A.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
-                    A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3),
+                    A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+                    A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2),
                 ], p=0.5),
                 A.OneOf([
                     A.GaussNoise(p=1.0),
                     A.GaussianBlur(blur_limit=(3, 7)),
-                ], p=0.3),
+                ], p=0.2),
                 ToTensorV2()
             ], bbox_params=A.BboxParams(
                 format='pascal_voc',

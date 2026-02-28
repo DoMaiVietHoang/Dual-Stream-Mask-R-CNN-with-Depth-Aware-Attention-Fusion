@@ -210,6 +210,23 @@ def evaluate(
             pred_masks_raw = pred.get('masks', None)
             pred_scores = pred['scores'].detach().cpu()            # [N]
 
+            # Filter low-confidence predictions to reduce FP noise in AP calc
+            # COCO uses maxDets=100; we also apply a min score threshold
+            score_filter = pred_scores > 0.05
+            if score_filter.any():
+                pred_scores = pred_scores[score_filter]
+                if pred_masks_raw is not None and len(pred_masks_raw) > 0:
+                    pred_masks_raw = pred_masks_raw[score_filter]
+                # Keep top-100 by score (COCO maxDets convention)
+                if len(pred_scores) > 100:
+                    topk_idx = pred_scores.argsort(descending=True)[:100]
+                    pred_scores = pred_scores[topk_idx]
+                    if pred_masks_raw is not None and len(pred_masks_raw) > 0:
+                        pred_masks_raw = pred_masks_raw[topk_idx]
+            else:
+                pred_scores = torch.zeros(0)
+                pred_masks_raw = None
+
             if pred_masks_raw is not None and len(pred_masks_raw) > 0:
                 # pred_masks_raw is already bool after postprocess (> 0.5 thresholded)
                 # Convert to float for interpolation
