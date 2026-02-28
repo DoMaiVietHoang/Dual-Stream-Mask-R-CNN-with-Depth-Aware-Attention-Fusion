@@ -538,20 +538,11 @@ class DualStreamMaskRCNN(nn.Module):
         image_sizes: List[Tuple[int, int]],
         original_sizes: List[Tuple[int, int]]
     ) -> List[Dict[str, torch.Tensor]]:
-        """Resize masks to original image size"""
+        """Paste masks into full image at bounding box locations and rescale boxes."""
+        from torchvision.models.detection.roi_heads import paste_masks_in_image
+
         for i, (det, im_size, orig_size) in enumerate(zip(detections, image_sizes, original_sizes)):
-            if 'masks' in det:
-                masks = det['masks']
-                if masks.numel() > 0:
-                    masks = F.interpolate(
-                        masks.float(),
-                        size=orig_size,
-                        mode='bilinear',
-                        align_corners=False
-                    )
-                    masks = masks > 0.5
-                    detections[i]['masks'] = masks
-                    
+            # Scale boxes from image_sizes to original_sizes first
             if 'boxes' in det:
                 boxes = det['boxes']
                 scale_x = orig_size[1] / im_size[1]
@@ -559,7 +550,24 @@ class DualStreamMaskRCNN(nn.Module):
                 boxes[:, [0, 2]] *= scale_x
                 boxes[:, [1, 3]] *= scale_y
                 detections[i]['boxes'] = boxes
-                
+
+            # Paste 28x28 masks into full image at box locations
+            if 'masks' in det:
+                masks = det['masks']  # [N, 1, 28, 28] float probabilities
+                boxes = det['boxes']  # [N, 4] already scaled to orig_size
+                if masks.numel() > 0 and len(boxes) > 0:
+                    # paste_masks_in_image expects [N, 1, H, W] float and boxes [N, 4]
+                    # returns [N, 1, H_orig, W_orig] float
+                    pasted = paste_masks_in_image(
+                        masks, boxes, orig_size, padding=1
+                    )
+                    detections[i]['masks'] = pasted > 0.5
+                else:
+                    h, w = orig_size
+                    detections[i]['masks'] = torch.zeros(
+                        (0, 1, h, w), dtype=torch.bool, device=masks.device
+                    )
+
         return detections
 
 
