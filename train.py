@@ -27,9 +27,13 @@ from config import Config
 
 
 class ModelEMA:
-    """Exponential Moving Average of model weights for stable evaluation."""
+    """Exponential Moving Average of model weights for stable evaluation.
 
-    def __init__(self, model: nn.Module, decay: float = 0.999):
+    Updates both parameters AND buffer (BatchNorm running stats) so that
+    the EMA model produces valid outputs in eval mode.
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.9998):
         import copy
         self.ema_model = copy.deepcopy(model)
         self.ema_model.eval()
@@ -39,8 +43,12 @@ class ModelEMA:
 
     def update(self, model: nn.Module):
         with torch.no_grad():
+            # Update parameters (weights, biases)
             for ema_p, model_p in zip(self.ema_model.parameters(), model.parameters()):
                 ema_p.data.mul_(self.decay).add_(model_p.data, alpha=1 - self.decay)
+            # Update buffers (BatchNorm running_mean, running_var, num_batches_tracked)
+            for ema_buf, model_buf in zip(self.ema_model.buffers(), model.buffers()):
+                ema_buf.data.copy_(model_buf.data)
 
     def state_dict(self):
         return self.ema_model.state_dict()
@@ -72,6 +80,7 @@ def train_one_epoch(
     device: torch.device,
     epoch: int,
     accumulation_steps: int = 4,
+    ema: Optional['ModelEMA'] = None,
     logger: Optional[logging.Logger] = None
 ) -> Dict[str, float]:
     """
@@ -84,6 +93,7 @@ def train_one_epoch(
         device: Device to train on
         epoch: Current epoch number
         accumulation_steps: Number of batches to accumulate before optimizer step
+        ema: ModelEMA instance — updated every optimizer step
         logger: Logger instance
 
     Returns:
@@ -128,6 +138,9 @@ def train_one_epoch(
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             optimizer.zero_grad()
+            # Update EMA every optimizer step (not just per epoch)
+            if ema is not None:
+                ema.update(model)
 
         # Accumulate unscaled losses for logging
         for key in loss_dict:
@@ -786,8 +799,11 @@ def main(args):
             best_f1 = checkpoint['metrics'].get('f1', 0.0)
     
     # Model EMA for stable evaluation
-    ema = ModelEMA(model, decay=0.999)
-    logger.info('Model EMA initialized (decay=0.999)')
+    # Updated every optimizer step (~len(train_loader)/accumulation_steps times per epoch)
+    # Buffers (BatchNorm running stats) are copied directly from training model
+    ema = ModelEMA(model, decay=0.9998)
+    updates_per_epoch = len(train_loader) // args.accumulation_steps
+    logger.info(f'Model EMA initialized (decay=0.9998, ~{updates_per_epoch} updates/epoch)')
 
     # Training loop
     logger.info('Starting training...')
@@ -797,7 +813,7 @@ def main(args):
     best_ap50 = 0.0
 
     for epoch in range(start_epoch, args.num_epochs):
-        # Train
+        # Train (EMA updated every optimizer step inside train_one_epoch)
         train_losses = train_one_epoch(
             model=model,
             dataloader=train_loader,
@@ -805,11 +821,9 @@ def main(args):
             device=device,
             epoch=epoch,
             accumulation_steps=args.accumulation_steps,
+            ema=ema,
             logger=logger
         )
-
-        # Update EMA weights
-        ema.update(model)
 
         # Log to TensorBoard
         for key, value in train_losses.items():
@@ -821,6 +835,20 @@ def main(args):
 
         # Evaluate using EMA model for stable metrics
         if (epoch + 1) % args.eval_interval == 0:
+            # For first 3 epochs, also evaluate training model to diagnose issues
+            if epoch < 3:
+                logger.info(f'[diagnostic] Evaluating TRAINING model (epoch {epoch})...')
+                train_metrics = evaluate(
+                    model=model,
+                    dataloader=val_loader,
+                    device=device,
+                    logger=logger,
+                    max_batches=args.max_eval_batches
+                )
+                logger.info(f'[diagnostic] Training model: AP50={train_metrics["AP50"]:.4f}, '
+                            f'P={train_metrics["precision"]:.4f}, R={train_metrics["recall"]:.4f}')
+
+            logger.info(f'Evaluating EMA model (epoch {epoch})...')
             metrics = evaluate(
                 model=ema.ema_model,
                 dataloader=val_loader,
