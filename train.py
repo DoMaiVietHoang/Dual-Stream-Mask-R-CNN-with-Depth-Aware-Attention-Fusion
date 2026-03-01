@@ -667,8 +667,8 @@ def save_checkpoint(
     checkpoint_path = os.path.join(output_dir, 'checkpoint_latest.pth')
     torch.save(checkpoint, checkpoint_path)
     
-    epoch_path = os.path.join(output_dir, f'checkpoint_epoch_{epoch}.pth')
-    torch.save(checkpoint, epoch_path)
+    # epoch_path = os.path.join(output_dir, f'checkpoint_epoch_{epoch}.pth')
+    # torch.save(checkpoint, epoch_path)
     
     if is_best:
         best_path = os.path.join(output_dir, 'checkpoint_best.pth')
