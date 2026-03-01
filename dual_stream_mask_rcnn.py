@@ -28,17 +28,20 @@ from modules.losses import BoundaryLoss
 
 class CustomRoIHeads(RoIHeads):
     """
-    Custom RoIHeads that adds boundary loss to the standard mask loss.
+    Custom RoIHeads that adds boundary loss and dice loss to the standard mask loss.
 
-    L_mask_total = L_mask_bce + lambda_boundary * L_boundary
+    L_mask_total = L_mask_bce + lambda_dice * L_dice + lambda_boundary * L_boundary
 
-    where L_boundary = ||∂(pred) - ∂(gt)|| using Sobel edge detection.
+    where L_boundary = ||∂(pred) - ∂(gt)|| using Sobel edge detection,
+    and L_dice = 1 - (2 * |pred ∩ gt| + ε) / (|pred| + |gt| + ε).
     All box detection logic is inherited unchanged from torchvision RoIHeads.
     """
 
-    def __init__(self, *args, lambda_boundary=0.5, boundary_edge_type='sobel', **kwargs):
+    def __init__(self, *args, lambda_boundary=0.5, lambda_dice=0.5,
+                 boundary_edge_type='sobel', **kwargs):
         super().__init__(*args, **kwargs)
         self.lambda_boundary = lambda_boundary
+        self.lambda_dice = lambda_dice
         self.boundary_loss_fn = BoundaryLoss(edge_type=boundary_edge_type)
 
     def forward(self, features, proposals, image_shapes, targets=None):
@@ -117,13 +120,18 @@ class CustomRoIHeads(RoIHeads):
                     mask_logits, mask_proposals, gt_masks, gt_labels, pos_matched_idxs
                 )
 
+                # Dice loss for better foreground/background balance
+                loss_dice = self._compute_dice_loss(
+                    mask_logits, mask_proposals, gt_masks, gt_labels, pos_matched_idxs
+                )
+
                 # Boundary loss for crown separation
                 loss_boundary = self._compute_boundary_loss(
                     mask_logits, mask_proposals, gt_masks, gt_labels, pos_matched_idxs
                 )
 
                 loss_mask = {
-                    "loss_mask": rcnn_loss_mask,
+                    "loss_mask": rcnn_loss_mask + self.lambda_dice * loss_dice,
                     "loss_boundary": self.lambda_boundary * loss_boundary,
                 }
             else:
@@ -175,6 +183,55 @@ class CustomRoIHeads(RoIHeads):
         boundary_loss = self.boundary_loss_fn(pred_masks, mask_targets_cat)
 
         return boundary_loss
+
+    def _compute_dice_loss(self, mask_logits, proposals, gt_masks, gt_labels, mask_matched_idxs):
+        """
+        Compute per-instance dice loss averaged over all positive proposals.
+
+        Dice loss complements BCE by directly optimizing mask overlap,
+        which is especially helpful when foreground pixels are sparse
+        within the ROI crop (small or thin tree crowns).
+
+        Args:
+            mask_logits: (N, num_classes, H, W) raw logits from mask predictor
+            proposals: list of (N_i, 4) positive proposal boxes per image
+            gt_masks: list of (M_i, H_img, W_img) ground truth masks per image
+            gt_labels: list of (M_i,) ground truth labels per image
+            mask_matched_idxs: list of (N_i,) matched GT indices per image
+
+        Returns:
+            dice_loss: scalar tensor
+        """
+        discretization_size = mask_logits.shape[-1]
+
+        labels = [gt_label[idxs] for gt_label, idxs in zip(gt_labels, mask_matched_idxs)]
+        mask_targets = [
+            project_masks_on_boxes(m, p, i, discretization_size)
+            for m, p, i in zip(gt_masks, proposals, mask_matched_idxs)
+        ]
+
+        labels_cat = torch.cat(labels, dim=0)
+        mask_targets_cat = torch.cat(mask_targets, dim=0)
+
+        if mask_targets_cat.numel() == 0:
+            return mask_logits.sum() * 0
+
+        # Select per-class logits and apply sigmoid
+        idx = torch.arange(labels_cat.shape[0], device=labels_cat.device)
+        pred_masks = torch.sigmoid(mask_logits[idx, labels_cat])  # (N, H, W)
+        gt = mask_targets_cat.float()  # (N, H, W)
+
+        # Per-instance dice: flatten spatial dims only
+        pred_flat = pred_masks.view(pred_masks.shape[0], -1)  # (N, H*W)
+        gt_flat = gt.view(gt.shape[0], -1)                    # (N, H*W)
+
+        intersection = (pred_flat * gt_flat).sum(dim=1)        # (N,)
+        cardinality = pred_flat.sum(dim=1) + gt_flat.sum(dim=1)  # (N,)
+
+        smooth = 1.0
+        dice = (2.0 * intersection + smooth) / (cardinality + smooth)  # (N,)
+
+        return (1.0 - dice).mean()
 
 
 class DualStreamBackboneWrapper(nn.Module):
@@ -274,7 +331,7 @@ class DualStreamMaskRCNN(nn.Module):
     5. RPN + ROI Heads (standard Mask R-CNN)
     
     Loss function:
-    L_total = L_cls + L_box + L_mask + λ * L_bound
+    L_total = L_cls + L_box + (L_mask_bce + λ_dice * L_dice) + λ_bound * L_bound
     """
     
     def __init__(
@@ -316,6 +373,7 @@ class DualStreamMaskRCNN(nn.Module):
         depth_model_type: str = 'small',
         # Loss settings
         lambda_boundary: float = 0.5,
+        lambda_dice: float = 0.5,
     ):
         super().__init__()
         
@@ -417,7 +475,7 @@ class DualStreamMaskRCNN(nn.Module):
                 num_classes
             )
         
-        # ROI heads with boundary loss
+        # ROI heads with boundary loss and dice loss
         self.roi_heads = CustomRoIHeads(
             # Box
             box_roi_pool,
@@ -437,6 +495,8 @@ class DualStreamMaskRCNN(nn.Module):
             mask_predictor,
             # Boundary loss for crown separation
             lambda_boundary=lambda_boundary,
+            # Dice loss for better mask overlap optimization
+            lambda_dice=lambda_dice,
         )
         
         # Image normalization
@@ -664,7 +724,8 @@ class MaskRCNNPredictor(nn.Sequential):
 def build_model(
     num_classes: int = 2,
     pretrained: bool = True,
-    lambda_boundary: float = 0.5
+    lambda_boundary: float = 0.5,
+    lambda_dice: float = 0.5
 ) -> DualStreamMaskRCNN:
     """
     Build Dual-Stream Mask R-CNN model
@@ -673,6 +734,7 @@ def build_model(
         num_classes: Number of classes (including background)
         pretrained: Whether to use pretrained backbone
         lambda_boundary: Weight for boundary loss
+        lambda_dice: Weight for dice loss
 
     Returns:
         model: DualStreamMaskRCNN instance
@@ -681,6 +743,7 @@ def build_model(
         num_classes=num_classes,
         pretrained_backbone=pretrained,
         lambda_boundary=lambda_boundary,
+        lambda_dice=lambda_dice,
         # For 1024x1024 images
         min_size=1024,
         max_size=1024,

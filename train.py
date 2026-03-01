@@ -725,7 +725,8 @@ def main(args):
     model = build_model(
         num_classes=args.num_classes,
         pretrained=args.pretrained,
-        lambda_boundary=args.lambda_boundary
+        lambda_boundary=args.lambda_boundary,
+        lambda_dice=args.lambda_dice
     )
     model = model.to(device)
     
@@ -907,6 +908,8 @@ if __name__ == '__main__':
                         help='Use pretrained backbone')
     parser.add_argument('--lambda-boundary', type=float, default=1.0,
                         help='Weight for boundary loss')
+    parser.add_argument('--lambda-dice', type=float, default=0.5,
+                        help='Weight for dice loss (mask overlap optimization)')
     
     # Training
     parser.add_argument('--batch-size', type=int, default=1,
