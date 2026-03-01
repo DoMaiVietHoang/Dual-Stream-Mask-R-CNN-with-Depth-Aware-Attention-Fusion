@@ -29,8 +29,9 @@ from config import Config
 class ModelEMA:
     """Exponential Moving Average of model weights for stable evaluation.
 
-    Updates both parameters AND buffer (BatchNorm running stats) so that
-    the EMA model produces valid outputs in eval mode.
+    Updates parameters AND float buffers (BatchNorm running stats) with EMA
+    smoothing so they stay consistent with the averaged weights.
+    Integer buffers (e.g. num_batches_tracked) are copied directly.
     """
 
     def __init__(self, model: nn.Module, decay: float = 0.9998):
@@ -46,9 +47,13 @@ class ModelEMA:
             # Update parameters (weights, biases)
             for ema_p, model_p in zip(self.ema_model.parameters(), model.parameters()):
                 ema_p.data.mul_(self.decay).add_(model_p.data, alpha=1 - self.decay)
-            # Update buffers (BatchNorm running_mean, running_var, num_batches_tracked)
+            # Update buffers: EMA-smooth float buffers (BN running_mean/var),
+            # direct-copy integer buffers (num_batches_tracked)
             for ema_buf, model_buf in zip(self.ema_model.buffers(), model.buffers()):
-                ema_buf.data.copy_(model_buf.data)
+                if ema_buf.is_floating_point():
+                    ema_buf.data.mul_(self.decay).add_(model_buf.data, alpha=1 - self.decay)
+                else:
+                    ema_buf.data.copy_(model_buf.data)
 
     def state_dict(self):
         return self.ema_model.state_dict()
@@ -726,7 +731,8 @@ def main(args):
         num_classes=args.num_classes,
         pretrained=args.pretrained,
         lambda_boundary=args.lambda_boundary,
-        lambda_dice=args.lambda_dice
+        lambda_dice=args.lambda_dice,
+        rgb_backbone=args.backbone,
     )
     model = model.to(device)
     
@@ -801,7 +807,7 @@ def main(args):
     
     # Model EMA for stable evaluation
     # Updated every optimizer step (~len(train_loader)/accumulation_steps times per epoch)
-    # Buffers (BatchNorm running stats) are copied directly from training model
+    # Both parameters and BN running stats use EMA smoothing for consistency
     ema = ModelEMA(model, decay=0.9998)
     updates_per_epoch = len(train_loader) // args.accumulation_steps
     logger.info(f'Model EMA initialized (decay=0.9998, ~{updates_per_epoch} updates/epoch)')
@@ -906,6 +912,9 @@ if __name__ == '__main__':
                         help='Number of classes (including background)')
     parser.add_argument('--pretrained', action='store_true', default=True,
                         help='Use pretrained backbone')
+    parser.add_argument('--backbone', type=str, default='resnet50',
+                        choices=['resnet50', 'resnet101', 'resnext101', 'convnext_base'],
+                        help='RGB stream backbone (default: resnet50)')
     parser.add_argument('--lambda-boundary', type=float, default=1.0,
                         help='Weight for boundary loss')
     parser.add_argument('--lambda-dice', type=float, default=0.5,

@@ -238,10 +238,10 @@ class DualStreamBackboneWrapper(nn.Module):
     """
     Wrapper for Dual-Stream Backbone that integrates with torchvision's detection framework
     """
-    def __init__(self, pretrained=True, out_channels=256):
+    def __init__(self, pretrained=True, out_channels=256, rgb_backbone='resnet50'):
         super().__init__()
-        
-        self.backbone = DualStreamBackbone(pretrained=pretrained)
+
+        self.backbone = DualStreamBackbone(pretrained=pretrained, rgb_backbone=rgb_backbone)
         rgb_channels, depth_channels = self.backbone.get_feature_channels()
         
         # Multi-scale DAAF for feature fusion
@@ -374,20 +374,23 @@ class DualStreamMaskRCNN(nn.Module):
         # Loss settings
         lambda_boundary: float = 0.5,
         lambda_dice: float = 0.5,
+        # Backbone selection
+        rgb_backbone: str = 'resnet50',
     ):
         super().__init__()
-        
+
         # Depth generator
         self.depth_generator = DepthGenerator(
             model_type=depth_model_type,
             pretrained=True
         )
-        
+
         # Dual-stream backbone with DAAF
         out_channels = 256
         self.backbone = DualStreamBackboneWrapper(
             pretrained=pretrained_backbone,
-            out_channels=out_channels
+            out_channels=out_channels,
+            rgb_backbone=rgb_backbone
         )
         
         # Anchor generator tuned for tree crown detection on 1024x1024 aerial images.
@@ -725,7 +728,8 @@ def build_model(
     num_classes: int = 2,
     pretrained: bool = True,
     lambda_boundary: float = 0.5,
-    lambda_dice: float = 0.5
+    lambda_dice: float = 0.5,
+    rgb_backbone: str = 'resnet50',
 ) -> DualStreamMaskRCNN:
     """
     Build Dual-Stream Mask R-CNN model
@@ -735,6 +739,7 @@ def build_model(
         pretrained: Whether to use pretrained backbone
         lambda_boundary: Weight for boundary loss
         lambda_dice: Weight for dice loss
+        rgb_backbone: RGB backbone name (resnet50, resnet101, resnext101, convnext_base)
 
     Returns:
         model: DualStreamMaskRCNN instance
@@ -744,6 +749,7 @@ def build_model(
         pretrained_backbone=pretrained,
         lambda_boundary=lambda_boundary,
         lambda_dice=lambda_dice,
+        rgb_backbone=rgb_backbone,
         # For 1024x1024 images
         min_size=1024,
         max_size=1024,
