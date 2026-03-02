@@ -494,7 +494,7 @@ if __name__ == '__main__':
     p.add_argument('--output-dir',  default='./outputs_rfdetr')
 
     # Model
-    p.add_argument('--variant',      default='base',
+    p.add_argument('--variant',      default='nano',
                    choices=['nano','small','medium','base','large'])
     p.add_argument('--num-classes',  type=int, default=1)
     p.add_argument('--pretrain-weights', default=None,

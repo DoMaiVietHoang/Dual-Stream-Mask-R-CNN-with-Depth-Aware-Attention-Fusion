@@ -243,12 +243,6 @@ class DualStreamLWDETR(nn.Module):
             refpt = self.lwdetr.refpoint_embed.weight[:self.lwdetr.num_queries]
             qfeat = self.lwdetr.query_feat.weight[:self.lwdetr.num_queries]
 
-        if self.lwdetr.segmentation_head is not None:
-            # Always use the dense forward (returns list of tensors [B, N, H, W])
-            # sparse_forward returns dicts which require special handling in loss_masks
-            # and would break _compute_boundary_loss. Dense forward is simpler and correct.
-            seg_fwd = self.lwdetr.segmentation_head.forward
-
         hs, ref_unsigmoid, hs_enc, ref_enc = self.lwdetr.transformer(
             srcs, masks, poss, refpt, qfeat
         )
@@ -265,18 +259,22 @@ class DualStreamLWDETR(nn.Module):
                 coord = (self.lwdetr.bbox_embed(hs) + ref_unsigmoid).sigmoid()
 
             cls_out = self.lwdetr.class_embed(hs)
-
             out = {"pred_logits": cls_out[-1], "pred_boxes": coord[-1]}
 
             if self.lwdetr.segmentation_head is not None:
-                masks_out = seg_fwd(features[0].tensors, hs, nested.tensors.shape[-2:])
-                out["pred_masks"] = masks_out[-1] if self.training else masks_out[-1]
+                # Dense forward on the last decoder layer only → [B, N*g, H_m, W_m]
+                # Avoids materialising all L layers at once (memory efficiency).
+                # hs[-1] is the last layer output [B, N*g, C]; wrap in list for seg head.
+                last_masks = self.lwdetr.segmentation_head.forward(
+                    features[0].tensors, hs[-1:], nested.tensors.shape[-2:]
+                )[0]   # [B, N*g, H_m, W_m]
+                out["pred_masks"] = last_masks
 
             if self.lwdetr.aux_loss:
-                out["aux_outputs"] = self.lwdetr._set_aux_loss(
-                    cls_out, coord,
-                    masks_out if self.lwdetr.segmentation_head else None
-                )
+                # For aux outputs: skip mask loss (too memory-intensive to compute
+                # [B, N*g, H_m, W_m] for every decoder layer at 1024×1024 input).
+                # Box and class aux losses still apply.
+                out["aux_outputs"] = self.lwdetr._set_aux_loss(cls_out, coord, None)
 
         if self.lwdetr.two_stage:
             g = self.lwdetr.group_detr if self.training else 1
@@ -286,30 +284,31 @@ class DualStreamLWDETR(nn.Module):
                 for gi in range(g)
             ], dim=1)
 
-            if self.lwdetr.segmentation_head is not None:
-                masks_enc = seg_fwd(
-                    features[0].tensors, [hs_enc],
-                    nested.tensors.shape[-2:], skip_blocks=True
-                )[0]
-
+            # NOTE: We intentionally skip enc mask prediction.
+            # At 1024×1024, hs_enc has ~N_enc*g tokens which makes the einsum
+            # [B, N_enc*g, H_m, W_m] prohibitively large (~several GiB).
+            # Only box+class losses are computed for enc_outputs.
             if hs is not None:
                 out["enc_outputs"] = {"pred_logits": cls_enc, "pred_boxes": ref_enc}
-                if self.lwdetr.segmentation_head is not None:
-                    out["enc_outputs"]["pred_masks"] = masks_enc
             else:
                 out = {"pred_logits": cls_enc, "pred_boxes": ref_enc}
-                if self.lwdetr.segmentation_head is not None:
-                    out["pred_masks"] = masks_enc
 
         # ── Training: compute losses ──────────────────────────────────────
         if self.training:
             assert targets is not None
+            # criterion only computes box + class losses (mask losses disabled)
             losses = self.criterion(out, targets)
 
-            # Boundary loss on predicted masks (last decoder layer)
-            if self.boundary_loss_fn is not None and "pred_masks" in out:
-                b_loss = self._compute_boundary_loss(out["pred_masks"], targets)
-                losses["loss_boundary"] = self.lambda_boundary * b_loss
+            # ── Manual mask losses on last-layer predictions ──────────────
+            if self.lwdetr.segmentation_head is not None and "pred_masks" in out:
+                pred_masks = out["pred_masks"]   # [B, N*g, H_m, W_m]
+                mask_losses = self._compute_mask_losses(pred_masks, targets)
+                losses.update(mask_losses)
+
+                # Boundary loss
+                if self.boundary_loss_fn is not None:
+                    b_loss = self._compute_boundary_loss(pred_masks, targets)
+                    losses["loss_boundary"] = self.lambda_boundary * b_loss
 
             return losses
 
@@ -318,6 +317,77 @@ class DualStreamLWDETR(nn.Module):
             [images.shape[-2:]], device=images.device
         ).repeat(images.shape[0], 1)
         return self.postprocessor(out, target_sizes)
+
+    # ------------------------------------------------------------------
+    # Mask loss helper  (CE + Dice on matched pairs, last decoder layer only)
+    # ------------------------------------------------------------------
+
+    def _compute_mask_losses(
+        self,
+        pred_masks: torch.Tensor,
+        targets: List[Dict],
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Compute BCE-CE and Dice mask losses on Hungarian-matched pairs.
+
+        pred_masks : [B, N_q*group_detr, H_m, W_m]  (logits)
+        targets    : list of dicts with 'boxes' (cxcywh norm), 'labels', 'masks'
+        """
+        device = pred_masks.device
+        B = pred_masks.shape[0]
+
+        # Greedy matching: for each GT mask find the best-matching predicted mask
+        # (avoids re-running Hungarian matcher or storing extra tensors)
+        src_masks_list = []
+        tgt_masks_list = []
+
+        for b in range(B):
+            gt_m = targets[b].get('masks', None)
+            if gt_m is None or len(gt_m) == 0:
+                continue
+            gt_m = gt_m.float().to(device)  # [M, H, W]
+            pm = pred_masks[b]               # [N_q*g, H_m, W_m]
+
+            # Resize pred to GT spatial size
+            Hg, Wg = gt_m.shape[-2], gt_m.shape[-1]
+            pm_r = F.interpolate(
+                pm.unsqueeze(0), size=(Hg, Wg), mode='bilinear', align_corners=False
+            ).squeeze(0)   # [N_q*g, Hg, Wg]
+
+            # Greedy matching: for each GT find best-matching pred (max dot-product)
+            with torch.no_grad():
+                pm_sig = torch.sigmoid(pm_r)
+                pm_flat = pm_sig.flatten(1)           # [N_q*g, HW]
+                gt_flat = (gt_m > 0.5).float().flatten(1)  # [M, HW]
+                scores  = torch.mm(pm_flat, gt_flat.t())   # [N_q*g, M]
+                best_src = scores.argmax(dim=0)            # [M]
+
+            matched_pred = pm_r[best_src]   # [M, Hg, Wg]
+            src_masks_list.append(matched_pred)
+            tgt_masks_list.append(gt_m)
+
+        if len(src_masks_list) == 0:
+            zero = pred_masks.sum() * 0.0
+            return {'loss_mask_ce': zero, 'loss_mask_dice': zero}
+
+        src_all = torch.cat(src_masks_list, dim=0)   # [N_total, Hg, Wg]
+        tgt_all = torch.cat(tgt_masks_list, dim=0)   # [N_total, Hg, Wg]
+
+        # BCE loss
+        loss_ce = F.binary_cross_entropy_with_logits(
+            src_all, tgt_all, reduction='mean'
+        )
+
+        # Dice loss
+        src_sig = torch.sigmoid(src_all).flatten(1)
+        tgt_f   = tgt_all.flatten(1)
+        inter   = (src_sig * tgt_f).sum(-1)
+        loss_dice = (1 - (2 * inter + 1) / (src_sig.sum(-1) + tgt_f.sum(-1) + 1)).mean()
+
+        return {
+            'loss_mask_ce'  : self.criterion.mask_ce_loss_coef   * loss_ce,
+            'loss_mask_dice': self.criterion.mask_dice_loss_coef * loss_dice,
+        }
 
     # ------------------------------------------------------------------
     # Boundary loss helper
@@ -370,7 +440,7 @@ class DualStreamLWDETR(nn.Module):
             losses.append(b_loss)
 
         if len(losses) == 0:
-            return pred_masks.sum() * 0.0
+            return pred_masks.sum() * 0.0  # zero with grad attached to model params
         return torch.stack(losses).mean()
 
 
@@ -502,6 +572,10 @@ def build_dual_stream_rfdetr(
         )
 
     # ── 5. Criterion & postprocessor ──────────────────────────────────────
+    # We intentionally build the criterion WITHOUT mask losses.
+    # Mask losses (CE + Dice) are computed manually in DualStreamLWDETR.forward
+    # only for the final decoder layer, avoiding OOM from enc_outputs mask tensors
+    # at 1024×1024 resolution with group_detr=13.
     args.num_classes         = num_classes
     args.focal_alpha         = 0.25
     args.cls_loss_coef       = cfg.cls_loss_coef
@@ -517,6 +591,8 @@ def build_dual_stream_rfdetr(
     args.mask_point_sample_ratio = 16
     args.sum_group_losses    = False
     args.device              = device
+    # Build criterion without mask losses (we handle masks separately)
+    args.segmentation_head   = False   # disables mask losses in criterion
 
     # Matcher args
     args.set_cost_class      = 2.0
@@ -524,6 +600,14 @@ def build_dual_stream_rfdetr(
     args.set_cost_giou       = 2.0
 
     criterion, postprocessor = build_criterion_and_postprocessors(args)
+
+    # Restore mask loss coefficients for use in weight_dict (added manually below)
+    # These are stored on the criterion so train_rfdetr.py can use them for logging
+    criterion.mask_ce_loss_coef   = args.mask_ce_loss_coef
+    criterion.mask_dice_loss_coef = args.mask_dice_loss_coef
+    if segmentation:
+        criterion.weight_dict['loss_mask_ce']   = args.mask_ce_loss_coef
+        criterion.weight_dict['loss_mask_dice'] = args.mask_dice_loss_coef
 
     # ── 6. Load pretrained RF-DETR weights ────────────────────────────────
     if pretrain_weights and os.path.isfile(pretrain_weights):
