@@ -513,12 +513,11 @@ class TreeCrownDatasetWithDepth(TreeCrownDataset):
                 boxes = np.zeros((0, 4), dtype=np.float32)
                 labels = np.zeros(0, dtype=np.int64)
         else:
+            # No annotations: don't pass masks/bboxes to albumentations
+            # (albumentations raises ValueError on empty masks)
             transformed = self.transforms(
                 image=image,
                 depth=depth,
-                masks=[],
-                bboxes=[],
-                class_labels=[]
             )
             image = transformed['image']
             depth = transformed['depth']
