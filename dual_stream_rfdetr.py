@@ -481,6 +481,8 @@ def build_dual_stream_rfdetr(
     args.num_queries         = cfg.num_queries if hasattr(cfg, 'num_queries') else 300
     args.group_detr          = cfg.group_detr
     args.use_cls_token       = False
+    args.decoder_norm        = 'LN'   # 'LN' or 'Identity'
+    args.segmentation_head   = segmentation   # used by build_criterion_and_postprocessors
 
     transformer = build_transformer(args)
 

@@ -35,7 +35,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dual_stream_rfdetr import build_dual_stream_rfdetr, DualStreamLWDETR
 from data import create_dataloader
 from train import (
-    compute_mask_iou, calculate_ap_metrics, calculate_ap_at_iou,
+    compute_mask_iou, calculate_ap_metrics,
     calculate_metrics_batch, setup_logging
 )
 
