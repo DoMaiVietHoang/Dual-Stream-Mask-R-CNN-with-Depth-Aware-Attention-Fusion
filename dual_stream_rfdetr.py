@@ -296,8 +296,16 @@ class DualStreamLWDETR(nn.Module):
         # ── Training: compute losses ──────────────────────────────────────
         if self.training:
             assert targets is not None
+            # Strip 'masks' from targets before passing to criterion.
+            # The installed HungarianMatcher checks `"masks" in targets[0]` and
+            # if True tries to access outputs["pred_masks"] from enc_outputs /
+            # aux_outputs — which causes KeyError since those dicts lack that key.
+            # We compute mask losses manually below via _compute_mask_losses().
+            targets_no_masks = [
+                {k: v for k, v in t.items() if k != 'masks'} for t in targets
+            ]
             # criterion only computes box + class losses (mask losses disabled)
-            losses = self.criterion(out, targets)
+            losses = self.criterion(out, targets_no_masks)
 
             # ── Manual mask losses on last-layer predictions ──────────────
             if self.lwdetr.segmentation_head is not None and "pred_masks" in out:
@@ -406,9 +414,9 @@ class DualStreamLWDETR(nn.Module):
         GT masks in targets[i]['masks']: [M_i, H, W]
         We use max-score matching (simple): take the max-logit pred per GT.
         """
-        # Guard: sparse_forward returns dicts — skip boundary loss gracefully
-        if isinstance(pred_masks, dict):
-            return torch.tensor(0.0, requires_grad=True)
+        # Guard: if pred_masks is not a tensor (e.g., sparse dict), skip gracefully
+        if not isinstance(pred_masks, torch.Tensor):
+            return torch.zeros(1, device=next(self.parameters()).device).squeeze()
 
         losses = []
         B = pred_masks.shape[0]
