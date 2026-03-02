@@ -28,17 +28,20 @@ from modules.losses import BoundaryLoss
 
 class CustomRoIHeads(RoIHeads):
     """
-    Custom RoIHeads that adds boundary loss to the standard mask loss.
+    Custom RoIHeads that adds boundary loss and dice loss to the standard mask loss.
 
-    L_mask_total = L_mask_bce + lambda_boundary * L_boundary
+    L_mask_total = L_mask_bce + lambda_dice * L_dice + lambda_boundary * L_boundary
 
-    where L_boundary = ||∂(pred) - ∂(gt)|| using Sobel edge detection.
+    where L_boundary = ||∂(pred) - ∂(gt)|| using Sobel edge detection,
+    and L_dice = 1 - (2 * |pred ∩ gt| + ε) / (|pred| + |gt| + ε).
     All box detection logic is inherited unchanged from torchvision RoIHeads.
     """
 
-    def __init__(self, *args, lambda_boundary=0.5, boundary_edge_type='sobel', **kwargs):
+    def __init__(self, *args, lambda_boundary=0.5, lambda_dice=0.5,
+                 boundary_edge_type='sobel', **kwargs):
         super().__init__(*args, **kwargs)
         self.lambda_boundary = lambda_boundary
+        self.lambda_dice = lambda_dice
         self.boundary_loss_fn = BoundaryLoss(edge_type=boundary_edge_type)
 
     def forward(self, features, proposals, image_shapes, targets=None):
@@ -117,13 +120,18 @@ class CustomRoIHeads(RoIHeads):
                     mask_logits, mask_proposals, gt_masks, gt_labels, pos_matched_idxs
                 )
 
+                # Dice loss for better foreground/background balance
+                loss_dice = self._compute_dice_loss(
+                    mask_logits, mask_proposals, gt_masks, gt_labels, pos_matched_idxs
+                )
+
                 # Boundary loss for crown separation
                 loss_boundary = self._compute_boundary_loss(
                     mask_logits, mask_proposals, gt_masks, gt_labels, pos_matched_idxs
                 )
 
                 loss_mask = {
-                    "loss_mask": rcnn_loss_mask,
+                    "loss_mask": rcnn_loss_mask + self.lambda_dice * loss_dice,
                     "loss_boundary": self.lambda_boundary * loss_boundary,
                 }
             else:
@@ -176,15 +184,64 @@ class CustomRoIHeads(RoIHeads):
 
         return boundary_loss
 
+    def _compute_dice_loss(self, mask_logits, proposals, gt_masks, gt_labels, mask_matched_idxs):
+        """
+        Compute per-instance dice loss averaged over all positive proposals.
+
+        Dice loss complements BCE by directly optimizing mask overlap,
+        which is especially helpful when foreground pixels are sparse
+        within the ROI crop (small or thin tree crowns).
+
+        Args:
+            mask_logits: (N, num_classes, H, W) raw logits from mask predictor
+            proposals: list of (N_i, 4) positive proposal boxes per image
+            gt_masks: list of (M_i, H_img, W_img) ground truth masks per image
+            gt_labels: list of (M_i,) ground truth labels per image
+            mask_matched_idxs: list of (N_i,) matched GT indices per image
+
+        Returns:
+            dice_loss: scalar tensor
+        """
+        discretization_size = mask_logits.shape[-1]
+
+        labels = [gt_label[idxs] for gt_label, idxs in zip(gt_labels, mask_matched_idxs)]
+        mask_targets = [
+            project_masks_on_boxes(m, p, i, discretization_size)
+            for m, p, i in zip(gt_masks, proposals, mask_matched_idxs)
+        ]
+
+        labels_cat = torch.cat(labels, dim=0)
+        mask_targets_cat = torch.cat(mask_targets, dim=0)
+
+        if mask_targets_cat.numel() == 0:
+            return mask_logits.sum() * 0
+
+        # Select per-class logits and apply sigmoid
+        idx = torch.arange(labels_cat.shape[0], device=labels_cat.device)
+        pred_masks = torch.sigmoid(mask_logits[idx, labels_cat])  # (N, H, W)
+        gt = mask_targets_cat.float()  # (N, H, W)
+
+        # Per-instance dice: flatten spatial dims only
+        pred_flat = pred_masks.view(pred_masks.shape[0], -1)  # (N, H*W)
+        gt_flat = gt.view(gt.shape[0], -1)                    # (N, H*W)
+
+        intersection = (pred_flat * gt_flat).sum(dim=1)        # (N,)
+        cardinality = pred_flat.sum(dim=1) + gt_flat.sum(dim=1)  # (N,)
+
+        smooth = 1.0
+        dice = (2.0 * intersection + smooth) / (cardinality + smooth)  # (N,)
+
+        return (1.0 - dice).mean()
+
 
 class DualStreamBackboneWrapper(nn.Module):
     """
     Wrapper for Dual-Stream Backbone that integrates with torchvision's detection framework
     """
-    def __init__(self, pretrained=True, out_channels=256):
+    def __init__(self, pretrained=True, out_channels=256, rgb_backbone='resnet50'):
         super().__init__()
-        
-        self.backbone = DualStreamBackbone(pretrained=pretrained)
+
+        self.backbone = DualStreamBackbone(pretrained=pretrained, rgb_backbone=rgb_backbone)
         rgb_channels, depth_channels = self.backbone.get_feature_channels()
         
         # Multi-scale DAAF for feature fusion
@@ -274,7 +331,7 @@ class DualStreamMaskRCNN(nn.Module):
     5. RPN + ROI Heads (standard Mask R-CNN)
     
     Loss function:
-    L_total = L_cls + L_box + L_mask + λ * L_bound
+    L_total = L_cls + L_box + (L_mask_bce + λ_dice * L_dice) + λ_bound * L_bound
     """
     
     def __init__(
@@ -316,20 +373,24 @@ class DualStreamMaskRCNN(nn.Module):
         depth_model_type: str = 'small',
         # Loss settings
         lambda_boundary: float = 0.5,
+        lambda_dice: float = 0.5,
+        # Backbone selection
+        rgb_backbone: str = 'resnet50',
     ):
         super().__init__()
-        
+
         # Depth generator
         self.depth_generator = DepthGenerator(
             model_type=depth_model_type,
             pretrained=True
         )
-        
+
         # Dual-stream backbone with DAAF
         out_channels = 256
         self.backbone = DualStreamBackboneWrapper(
             pretrained=pretrained_backbone,
-            out_channels=out_channels
+            out_channels=out_channels,
+            rgb_backbone=rgb_backbone
         )
         
         # Anchor generator tuned for tree crown detection on 1024x1024 aerial images.
@@ -393,11 +454,11 @@ class DualStreamMaskRCNN(nn.Module):
                 num_classes
             )
         
-        # Mask ROI pooling
+        # Mask ROI pooling — 28×28 for higher mask resolution
         if mask_roi_pool is None:
             mask_roi_pool = MultiScaleRoIAlign(
                 featmap_names=['0', '1', '2', '3'],
-                output_size=14,
+                output_size=28,
                 sampling_ratio=2
             )
         
@@ -417,7 +478,7 @@ class DualStreamMaskRCNN(nn.Module):
                 num_classes
             )
         
-        # ROI heads with boundary loss
+        # ROI heads with boundary loss and dice loss
         self.roi_heads = CustomRoIHeads(
             # Box
             box_roi_pool,
@@ -437,6 +498,8 @@ class DualStreamMaskRCNN(nn.Module):
             mask_predictor,
             # Boundary loss for crown separation
             lambda_boundary=lambda_boundary,
+            # Dice loss for better mask overlap optimization
+            lambda_dice=lambda_dice,
         )
         
         # Image normalization
@@ -538,20 +601,11 @@ class DualStreamMaskRCNN(nn.Module):
         image_sizes: List[Tuple[int, int]],
         original_sizes: List[Tuple[int, int]]
     ) -> List[Dict[str, torch.Tensor]]:
-        """Resize masks to original image size"""
+        """Paste masks into full image at bounding box locations and rescale boxes."""
+        from torchvision.models.detection.roi_heads import paste_masks_in_image
+
         for i, (det, im_size, orig_size) in enumerate(zip(detections, image_sizes, original_sizes)):
-            if 'masks' in det:
-                masks = det['masks']
-                if masks.numel() > 0:
-                    masks = F.interpolate(
-                        masks.float(),
-                        size=orig_size,
-                        mode='bilinear',
-                        align_corners=False
-                    )
-                    masks = masks > 0.5
-                    detections[i]['masks'] = masks
-                    
+            # Scale boxes from image_sizes to original_sizes first
             if 'boxes' in det:
                 boxes = det['boxes']
                 scale_x = orig_size[1] / im_size[1]
@@ -559,7 +613,24 @@ class DualStreamMaskRCNN(nn.Module):
                 boxes[:, [0, 2]] *= scale_x
                 boxes[:, [1, 3]] *= scale_y
                 detections[i]['boxes'] = boxes
-                
+
+            # Paste 28x28 masks into full image at box locations
+            if 'masks' in det:
+                masks = det['masks']  # [N, 1, 28, 28] float probabilities
+                boxes = det['boxes']  # [N, 4] already scaled to orig_size
+                if masks.numel() > 0 and len(boxes) > 0:
+                    # paste_masks_in_image expects [N, 1, H, W] float and boxes [N, 4]
+                    # returns [N, 1, H_orig, W_orig] float
+                    pasted = paste_masks_in_image(
+                        masks, boxes, orig_size, padding=1
+                    )
+                    detections[i]['masks'] = pasted > 0.5
+                else:
+                    h, w = orig_size
+                    detections[i]['masks'] = torch.zeros(
+                        (0, 1, h, w), dtype=torch.bool, device=masks.device
+                    )
+
         return detections
 
 
@@ -590,42 +661,75 @@ class FastRCNNPredictor(nn.Module):
         return scores, bbox_deltas
 
 
-class MaskRCNNHeads(nn.Sequential):
-    """Mask head with conv layers"""
+class MaskRCNNHeads(nn.Module):
+    """Enhanced mask head with residual connections for better spatial refinement.
+
+    Architecture: 4 conv blocks with a residual shortcut every 2 layers,
+    operating at 28×28 (from mask_roi_pool output_size=28).
+    """
+
     def __init__(self, in_channels, layers, dilation):
-        d = OrderedDict()
+        super().__init__()
+        self.blocks = nn.ModuleList()
         next_feature = in_channels
         for layer_idx, layer_features in enumerate(layers):
-            d[f'mask_fcn{layer_idx + 1}'] = nn.Conv2d(
-                next_feature, layer_features, 3, padding=dilation, dilation=dilation
-            )
-            d[f'relu{layer_idx + 1}'] = nn.ReLU(inplace=True)
+            self.blocks.append(nn.Sequential(
+                nn.Conv2d(next_feature, layer_features, 3,
+                          padding=dilation, dilation=dilation),
+                nn.BatchNorm2d(layer_features),
+                nn.ReLU(inplace=True),
+            ))
             next_feature = layer_features
-        super().__init__(d)
-        
-        for name, param in self.named_parameters():
-            if 'weight' in name:
-                nn.init.kaiming_normal_(param, mode='fan_out', nonlinearity='relu')
+
+        # 1×1 projections for residual shortcuts (every 2 layers)
+        self.shortcut_01 = nn.Conv2d(in_channels, layers[1], 1) if in_channels != layers[1] else nn.Identity()
+        self.shortcut_23 = nn.Conv2d(layers[1], layers[3], 1) if layers[1] != layers[3] else nn.Identity()
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        identity = x
+        x = self.blocks[0](x)
+        x = self.blocks[1](x)
+        x = x + self.shortcut_01(identity)  # residual after block 0-1
+
+        identity = x
+        x = self.blocks[2](x)
+        x = self.blocks[3](x)
+        x = x + self.shortcut_23(identity)  # residual after block 2-3
+        return x
 
 
 class MaskRCNNPredictor(nn.Sequential):
-    """Mask predictor"""
+    """Mask predictor with 2-step upsampling for higher resolution output.
+
+    28×28 → 56×56 (deconv) → 56×56 (logits)
+    """
+
     def __init__(self, in_channels, dim_reduced, num_classes):
         super().__init__(OrderedDict([
             ('conv5_mask', nn.ConvTranspose2d(in_channels, dim_reduced, 2, 2, 0)),
+            ('bn5', nn.BatchNorm2d(dim_reduced)),
             ('relu', nn.ReLU(inplace=True)),
             ('mask_fcn_logits', nn.Conv2d(dim_reduced, num_classes, 1, 1, 0)),
         ]))
-        
+
         for name, param in self.named_parameters():
-            if 'weight' in name:
+            if 'weight' in name and 'bn' not in name:
                 nn.init.kaiming_normal_(param, mode='fan_out', nonlinearity='relu')
 
 
 def build_model(
     num_classes: int = 2,
     pretrained: bool = True,
-    lambda_boundary: float = 0.5
+    lambda_boundary: float = 0.5,
+    lambda_dice: float = 0.5,
+    rgb_backbone: str = 'resnet50',
 ) -> DualStreamMaskRCNN:
     """
     Build Dual-Stream Mask R-CNN model
@@ -634,6 +738,8 @@ def build_model(
         num_classes: Number of classes (including background)
         pretrained: Whether to use pretrained backbone
         lambda_boundary: Weight for boundary loss
+        lambda_dice: Weight for dice loss
+        rgb_backbone: RGB backbone name (resnet50, resnet101, resnext101, convnext_base)
 
     Returns:
         model: DualStreamMaskRCNN instance
@@ -642,13 +748,15 @@ def build_model(
         num_classes=num_classes,
         pretrained_backbone=pretrained,
         lambda_boundary=lambda_boundary,
+        lambda_dice=lambda_dice,
+        rgb_backbone=rgb_backbone,
         # For 1024x1024 images
         min_size=1024,
         max_size=1024,
-        # Higher NMS threshold so touching crowns are not suppressed (default 0.5)
-        box_nms_thresh=0.6,
-        # More detections per image — dense canopy can have 200+ crowns per tile
-        box_detections_per_img=300,
+        # NMS threshold: balance between separating touching crowns and reducing FP
+        box_nms_thresh=0.5,
+        # Max detections per image — typical dense tiles have ~30-50 crowns
+        box_detections_per_img=100,
         # More RPN proposals kept after NMS so small/overlapping crowns survive
         rpn_post_nms_top_n_train=3000,
         rpn_post_nms_top_n_test=1500,
