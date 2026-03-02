@@ -244,9 +244,10 @@ class DualStreamLWDETR(nn.Module):
             qfeat = self.lwdetr.query_feat.weight[:self.lwdetr.num_queries]
 
         if self.lwdetr.segmentation_head is not None:
-            seg_fwd = (self.lwdetr.segmentation_head.sparse_forward
-                       if self.training
-                       else self.lwdetr.segmentation_head.forward)
+            # Always use the dense forward (returns list of tensors [B, N, H, W])
+            # sparse_forward returns dicts which require special handling in loss_masks
+            # and would break _compute_boundary_loss. Dense forward is simpler and correct.
+            seg_fwd = self.lwdetr.segmentation_head.forward
 
         hs, ref_unsigmoid, hs_enc, ref_enc = self.lwdetr.transformer(
             srcs, masks, poss, refpt, qfeat
@@ -324,16 +325,21 @@ class DualStreamLWDETR(nn.Module):
 
     def _compute_boundary_loss(
         self,
-        pred_masks: torch.Tensor,
+        pred_masks,
         targets: List[Dict],
     ) -> torch.Tensor:
         """
         Compute BoundaryLoss on matched predicted vs GT masks.
 
-        pred_masks: [B, N_queries, H_m, W_m]  (logits)
+        pred_masks: [B, N_queries, H_m, W_m]  (logits, dense tensor)
+                    OR a dict from sparse_forward (skipped in that case)
         GT masks in targets[i]['masks']: [M_i, H, W]
         We use max-score matching (simple): take the max-logit pred per GT.
         """
+        # Guard: sparse_forward returns dicts — skip boundary loss gracefully
+        if isinstance(pred_masks, dict):
+            return torch.tensor(0.0, requires_grad=True)
+
         losses = []
         B = pred_masks.shape[0]
 

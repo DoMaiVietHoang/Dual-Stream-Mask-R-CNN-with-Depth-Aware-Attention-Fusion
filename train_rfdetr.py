@@ -70,9 +70,13 @@ def convert_targets_for_rfdetr(
         else:
             boxes_cxcywh = boxes
 
+        # RF-DETR uses 0-indexed labels; dataset returns COCO category_ids (1-indexed)
+        labels = t['labels'].clone()
+        labels = (labels - 1).clamp(min=0)   # 1→0, 2→1, … ; guards against category_id=0
+
         new_t = {
             'boxes' : boxes_cxcywh,
-            'labels': t['labels'],
+            'labels': labels,
         }
         if 'masks' in t:
             new_t['masks'] = t['masks']
