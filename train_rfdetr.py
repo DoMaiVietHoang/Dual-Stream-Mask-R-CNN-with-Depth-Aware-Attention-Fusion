@@ -97,11 +97,13 @@ def train_one_epoch(
     epoch: int,
     accumulation_steps: int = 4,
     logger: Optional[logging.Logger] = None,
+    use_amp: bool = True,
 ) -> Dict[str, float]:
 
     model.train()
     total_losses: Dict[str, float] = {}
     optimizer.zero_grad()
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     pbar = tqdm(dataloader, desc=f'Epoch {epoch}')
 
@@ -122,7 +124,8 @@ def train_one_epoch(
         rfdetr_targets = convert_targets_for_rfdetr(targets, image_h, image_w)
 
         try:
-            loss_dict = model(images, targets=rfdetr_targets, depth_maps=depth_maps)
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                loss_dict = model(images, targets=rfdetr_targets, depth_maps=depth_maps)
         except Exception as e:
             if logger:
                 logger.error(f'Train batch {batch_idx} error: {e}')
@@ -137,12 +140,14 @@ def train_one_epoch(
             for k in loss_dict
             if k in weight_dict
         )
-        scaled_loss = losses / accumulation_steps
+        scaled_loss = scaler.scale(losses / accumulation_steps)
         scaled_loss.backward()
 
         if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(dataloader):
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             optimizer.zero_grad()
 
         # Accumulate for logging
@@ -153,10 +158,12 @@ def train_one_epoch(
         total_losses.setdefault('loss_total', 0.0)
         total_losses['loss_total'] += losses.item()
 
+        def _scalar(v):
+            return v.item() if isinstance(v, torch.Tensor) else v
         pbar.set_postfix({
             'loss': f'{losses.item():.4f}',
-            'cls' : f'{loss_dict.get("loss_ce", 0):.4f}',
-            'bbox': f'{loss_dict.get("loss_bbox", 0):.4f}',
+            'cls' : f'{_scalar(loss_dict.get("loss_ce", 0)):.4f}',
+            'bbox': f'{_scalar(loss_dict.get("loss_bbox", 0)):.4f}',
         })
 
         if batch_idx % 100 == 0 and batch_idx > 0:
@@ -389,6 +396,7 @@ def main(args):
         resolution=args.image_size,
         segmentation=True,
         device=args.device,
+        mask_downsample_ratio=args.mask_downsample_ratio,
     )
     model = model.to(device)
 
@@ -451,7 +459,8 @@ def main(args):
     for epoch in range(start_epoch, args.num_epochs):
         train_losses = train_one_epoch(
             model, train_loader, optimizer, device, epoch,
-            accumulation_steps=args.accumulation_steps, logger=logger
+            accumulation_steps=args.accumulation_steps, logger=logger,
+            use_amp=args.amp,
         )
         for k, v in train_losses.items():
             writer.add_scalar(f'train/{k}', v, epoch)
@@ -501,6 +510,8 @@ if __name__ == '__main__':
                    help='Path to RF-DETR pretrained .pth (None = train from scratch)')
     p.add_argument('--freeze-encoder', action='store_true', default=False)
     p.add_argument('--lambda-boundary', type=float, default=0.5)
+    p.add_argument('--mask-downsample-ratio', type=int, default=8,
+                   help='Mask spatial downsample (4=H/4×W/4, 8=H/8×W/8). Higher=less memory.')
 
     # Training
     p.add_argument('--batch-size',        type=int,   default=2)
@@ -509,7 +520,8 @@ if __name__ == '__main__':
     p.add_argument('--learning-rate',     type=float, default=1e-4)
     p.add_argument('--weight-decay',      type=float, default=1e-4)
     p.add_argument('--num-workers',       type=int,   default=4)
-    p.add_argument('--image-size',        type=int,   default=1024)
+    p.add_argument('--image-size',        type=int,   default=640,
+                   help='Input resolution. 640 fits 16GB VRAM; 1024 needs 24GB+ or grad-ckpt.')
     p.add_argument('--accumulation-steps',type=int,   default=4)
     p.add_argument('--early-stopping-patience', type=int, default=10)
 
@@ -517,9 +529,13 @@ if __name__ == '__main__':
     p.add_argument('--eval-interval',    type=int,   default=1)
     p.add_argument('--max-eval-batches', type=int,   default=None)
 
-    # Device
+    # Device / precision
     p.add_argument('--device',  default='cuda')
     p.add_argument('--resume',  default=None)
+    p.add_argument('--amp',     action='store_true', default=True,
+                   help='Use AMP (FP16) — halves memory. Default: on.')
+    p.add_argument('--no-amp',  dest='amp', action='store_false',
+                   help='Disable AMP, use FP32.')
 
     args = p.parse_args()
     main(args)

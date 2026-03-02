@@ -262,12 +262,17 @@ class DualStreamLWDETR(nn.Module):
             out = {"pred_logits": cls_out[-1], "pred_boxes": coord[-1]}
 
             if self.lwdetr.segmentation_head is not None:
-                # Dense forward on the last decoder layer only → [B, N*g, H_m, W_m]
-                # Avoids materialising all L layers at once (memory efficiency).
-                # hs[-1] is the last layer output [B, N*g, C]; wrap in list for seg head.
+                # Dense forward on the last decoder layer only.
+                # During training hs[-1] has shape [B, N_q*group_detr, C].
+                # We only need masks for the first N_q "real" queries — the remaining
+                # N_q*(g-1) are group-DETR duplicates and are not needed for mask loss.
+                # This reduces the mask tensor from [B, N*13, H_m, W_m] → [B, N, H_m, W_m],
+                # cutting mask memory from ~1 GiB to ~80 MiB at 1024×1024.
+                nq = self.lwdetr.num_queries
+                hs_last_nq = hs[-1][:, :nq, :]   # [B, N_q, C]
                 last_masks = self.lwdetr.segmentation_head.forward(
-                    features[0].tensors, hs[-1:], nested.tensors.shape[-2:]
-                )[0]   # [B, N*g, H_m, W_m]
+                    features[0].tensors, [hs_last_nq], nested.tensors.shape[-2:]
+                )[0]   # [B, N_q, H_m, W_m]
                 out["pred_masks"] = last_masks
 
             if self.lwdetr.aux_loss:
@@ -309,7 +314,7 @@ class DualStreamLWDETR(nn.Module):
 
             # ── Manual mask losses on last-layer predictions ──────────────
             if self.lwdetr.segmentation_head is not None and "pred_masks" in out:
-                pred_masks = out["pred_masks"]   # [B, N*g, H_m, W_m]
+                pred_masks = out["pred_masks"]   # [B, N_q, H_m, W_m]
                 mask_losses = self._compute_mask_losses(pred_masks, targets)
                 losses.update(mask_losses)
 
@@ -338,7 +343,7 @@ class DualStreamLWDETR(nn.Module):
         """
         Compute BCE-CE and Dice mask losses on Hungarian-matched pairs.
 
-        pred_masks : [B, N_q*group_detr, H_m, W_m]  (logits)
+        pred_masks : [B, N_q, H_m, W_m]  (logits; only first N_q queries, no group-DETR duplicates)
         targets    : list of dicts with 'boxes' (cxcywh norm), 'labels', 'masks'
         """
         device = pred_masks.device
@@ -354,25 +359,26 @@ class DualStreamLWDETR(nn.Module):
             if gt_m is None or len(gt_m) == 0:
                 continue
             gt_m = gt_m.float().to(device)  # [M, H, W]
-            pm = pred_masks[b]               # [N_q*g, H_m, W_m]
+            pm = pred_masks[b]               # [N_q, H_m, W_m]
+            Hm, Wm = pm.shape[-2], pm.shape[-1]
 
-            # Resize pred to GT spatial size
-            Hg, Wg = gt_m.shape[-2], gt_m.shape[-1]
-            pm_r = F.interpolate(
-                pm.unsqueeze(0), size=(Hg, Wg), mode='bilinear', align_corners=False
-            ).squeeze(0)   # [N_q*g, Hg, Wg]
+            # Resize GT masks DOWN to pred mask spatial size — much cheaper than
+            # resizing all N_q pred masks UP to full 1024×1024 resolution.
+            gt_m_small = F.interpolate(
+                gt_m.unsqueeze(0), size=(Hm, Wm), mode='bilinear', align_corners=False
+            ).squeeze(0)   # [M, Hm, Wm]
 
             # Greedy matching: for each GT find best-matching pred (max dot-product)
             with torch.no_grad():
-                pm_sig = torch.sigmoid(pm_r)
-                pm_flat = pm_sig.flatten(1)           # [N_q*g, HW]
-                gt_flat = (gt_m > 0.5).float().flatten(1)  # [M, HW]
-                scores  = torch.mm(pm_flat, gt_flat.t())   # [N_q*g, M]
-                best_src = scores.argmax(dim=0)            # [M]
+                pm_sig = torch.sigmoid(pm)
+                pm_flat = pm_sig.flatten(1)                     # [N_q, Hm*Wm]
+                gt_flat = (gt_m_small > 0.5).float().flatten(1) # [M, Hm*Wm]
+                scores  = torch.mm(pm_flat, gt_flat.t())        # [N_q, M]
+                best_src = scores.argmax(dim=0)                 # [M]
 
-            matched_pred = pm_r[best_src]   # [M, Hg, Wg]
+            matched_pred = pm[best_src]        # [M, Hm, Wm]  (logits)
             src_masks_list.append(matched_pred)
-            tgt_masks_list.append(gt_m)
+            tgt_masks_list.append(gt_m_small)
 
         if len(src_masks_list) == 0:
             zero = pred_masks.sum() * 0.0
@@ -428,23 +434,23 @@ class DualStreamLWDETR(nn.Module):
 
             gt_m = gt_m.float().to(pred_masks.device)   # [M, H, W]
             pm   = pred_masks[b]                          # [N_q, Hm, Wm]
+            Hm, Wm = pm.shape[-2], pm.shape[-1]
 
-            # Resize pred masks to GT spatial size
-            Hg, Wg = gt_m.shape[-2], gt_m.shape[-1]
-            pm_resized = F.interpolate(
-                pm.unsqueeze(0), size=(Hg, Wg), mode='bilinear', align_corners=False
-            ).squeeze(0)   # [N_q, Hg, Wg]
+            # Resize GT masks DOWN to pred spatial size (cheap: M masks vs N_q preds)
+            gt_m_small = F.interpolate(
+                gt_m.unsqueeze(0), size=(Hm, Wm), mode='bilinear', align_corners=False
+            ).squeeze(0)   # [M, Hm, Wm]
 
-            pm_sig = torch.sigmoid(pm_resized)  # [N_q, Hg, Wg]
+            pm_sig = torch.sigmoid(pm)   # [N_q, Hm, Wm]
 
             # Match: for each GT mask find the pred with highest IoU (approx via dot)
-            pm_flat = pm_sig.view(pm_sig.shape[0], -1)   # [N_q, HW]
-            gt_flat = (gt_m > 0.5).float().view(gt_m.shape[0], -1)  # [M, HW]
-            inter   = torch.mm(pm_flat, gt_flat.t())      # [N_q, M]
-            best_pred_per_gt = inter.argmax(dim=0)         # [M]
+            pm_flat = pm_sig.view(pm_sig.shape[0], -1)             # [N_q, Hm*Wm]
+            gt_flat = (gt_m_small > 0.5).float().view(gt_m_small.shape[0], -1)  # [M, Hm*Wm]
+            inter   = torch.mm(pm_flat, gt_flat.t())               # [N_q, M]
+            best_pred_per_gt = inter.argmax(dim=0)                  # [M]
 
-            matched_preds = pm_sig[best_pred_per_gt]       # [M, Hg, Wg]
-            b_loss = self.boundary_loss_fn(matched_preds, gt_m)
+            matched_preds = pm_sig[best_pred_per_gt]               # [M, Hm, Wm]
+            b_loss = self.boundary_loss_fn(matched_preds, gt_m_small)
             losses.append(b_loss)
 
         if len(losses) == 0:
@@ -477,6 +483,7 @@ def build_dual_stream_rfdetr(
     resolution: int = 1024,
     segmentation: bool = True,
     device: str = 'cuda',
+    mask_downsample_ratio: int = 8,
 ) -> DualStreamLWDETR:
     """
     Build the Dual-Stream RF-DETR model.
@@ -493,6 +500,8 @@ def build_dual_stream_rfdetr(
         resolution      : input resolution (default 1024 for aerial imagery)
         segmentation    : include segmentation head
         device          : 'cuda' or 'cpu'
+        mask_downsample_ratio: spatial downsample for masks (4=full, 8=half, 16=quarter)
+                               higher values save GPU memory at cost of mask resolution
 
     Returns:
         DualStreamLWDETR model
@@ -528,7 +537,7 @@ def build_dual_stream_rfdetr(
         rms_norm=getattr(cfg, 'rms_norm', False),
         backbone_lora=False,
         force_no_pretrain=(pretrain_weights is None),
-        gradient_checkpointing=False,
+        gradient_checkpointing=True,   # saves ~30% backbone memory at ~20% compute cost
         load_dinov2_weights=True,
         patch_size=cfg.patch_size,
         num_windows=cfg.num_windows,
@@ -576,7 +585,7 @@ def build_dual_stream_rfdetr(
         seg_head = SegmentationHead(
             cfg.hidden_dim,
             cfg.dec_layers,
-            downsample_ratio=cfg.mask_downsample_ratio,
+            downsample_ratio=mask_downsample_ratio,   # configurable; default 8 saves memory
         )
 
     # ── 5. Criterion & postprocessor ──────────────────────────────────────
