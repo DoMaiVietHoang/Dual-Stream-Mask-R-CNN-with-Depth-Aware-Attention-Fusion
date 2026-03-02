@@ -332,10 +332,12 @@ class TreeCrownDataset(Dataset):
                 boxes = np.zeros((0, 4), dtype=np.float32)
                 labels = np.zeros(0, dtype=np.int64)
         else:
-            # Even with no boxes, must provide empty lists for bbox_params fields
+            # No annotations: use dummy mask (albumentations rejects empty masks list)
+            h, w = image.shape[:2]
+            dummy_mask = np.zeros((h, w), dtype=np.uint8)
             transformed = self.transforms(
                 image=image,
-                masks=[],
+                masks=[dummy_mask],
                 bboxes=[],
                 class_labels=[]
             )
@@ -513,11 +515,16 @@ class TreeCrownDatasetWithDepth(TreeCrownDataset):
                 boxes = np.zeros((0, 4), dtype=np.float32)
                 labels = np.zeros(0, dtype=np.int64)
         else:
-            # No annotations: don't pass masks/bboxes to albumentations
-            # (albumentations raises ValueError on empty masks)
+            # No annotations: pass empty bboxes/class_labels (required by BboxParams)
+            # but use a dummy mask (albumentations rejects empty masks list).
+            h, w = image.shape[:2]
+            dummy_mask = np.zeros((h, w), dtype=np.uint8)
             transformed = self.transforms(
                 image=image,
                 depth=depth,
+                masks=[dummy_mask],
+                bboxes=[],
+                class_labels=[],
             )
             image = transformed['image']
             depth = transformed['depth']
