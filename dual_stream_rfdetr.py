@@ -40,6 +40,7 @@ from rfdetr.models.segmentation_head import SegmentationHead
 from rfdetr.models.matcher import build_matcher
 from rfdetr.models.position_encoding import build_position_encoding
 from rfdetr.util.misc import NestedTensor, nested_tensor_from_tensor_list
+from rfdetr.assets.model_weights import download_pretrain_weights
 from rfdetr.config import (
     RFDETRBaseConfig, RFDETRLargeConfig, RFDETRSmallConfig,
     RFDETRMediumConfig, RFDETRNanoConfig,
@@ -542,9 +543,9 @@ def build_dual_stream_rfdetr(
         target_shape=(resolution, resolution),
         rms_norm=getattr(cfg, 'rms_norm', False),
         backbone_lora=False,
-        force_no_pretrain=(pretrain_weights is None),
+        force_no_pretrain=False,
         gradient_checkpointing=True,   # saves ~30% backbone memory at ~20% compute cost
-        load_dinov2_weights=True,
+        load_dinov2_weights=False,  # weights come from RF-DETR pretrained checkpoint
         patch_size=cfg.patch_size,
         num_windows=cfg.num_windows,
         positional_encoding_size=cfg.positional_encoding_size,
@@ -632,17 +633,7 @@ def build_dual_stream_rfdetr(
         criterion.weight_dict['loss_mask_ce']   = args.mask_ce_loss_coef
         criterion.weight_dict['loss_mask_dice'] = args.mask_dice_loss_coef
 
-    # ── 6. Load pretrained RF-DETR weights ────────────────────────────────
-    if pretrain_weights and os.path.isfile(pretrain_weights):
-        state = torch.load(pretrain_weights, map_location='cpu')
-        if 'model' in state:
-            state = state['model']
-        # Load into LWDETR sub-module; new depth/DAAF weights won't exist → strict=False
-        missing, unexpected = dual_backbone.load_state_dict(state, strict=False)
-        print(f'[dual_stream_rfdetr] Loaded pretrained weights: '
-              f'{len(missing)} missing, {len(unexpected)} unexpected keys')
-
-    # ── 7. Assemble final model ───────────────────────────────────────────
+    # ── 6. Assemble final model ───────────────────────────────────────────
     model = DualStreamLWDETR(
         joiner=joiner,
         transformer=transformer,
@@ -660,5 +651,85 @@ def build_dual_stream_rfdetr(
         lite_refpoint_refine=cfg.lite_refpoint_refine,
         bbox_reparam=cfg.bbox_reparam,
     )
+
+    # ── 7. Load pretrained RF-DETR weights ────────────────────────────────
+    # Auto-download if pretrain_weights is a known model name (e.g. "rf-detr-nano.pth")
+    # If user didn't specify, use the variant's default COCO-pretrained weights.
+    if pretrain_weights is None:
+        pretrain_weights = cfg.pretrain_weights   # e.g. "rf-detr-nano.pth"
+
+    if pretrain_weights:
+        # Download if not already on disk
+        if not os.path.isfile(pretrain_weights):
+            try:
+                download_pretrain_weights(pretrain_weights)
+            except Exception as e:
+                print(f'[dual_stream_rfdetr] Could not download {pretrain_weights}: {e}')
+                pretrain_weights = None
+
+    if pretrain_weights and os.path.isfile(pretrain_weights):
+        state = torch.load(pretrain_weights, map_location='cpu')
+        if 'model' in state:
+            state = state['model']
+
+        # Pretrained RF-DETR keys are for bare LWDETR (e.g. "backbone.0.encoder...",
+        # "class_embed.weight", "transformer...").
+        # In our model these live under model.lwdetr, so prefix all keys with "lwdetr.".
+        #
+        # Backbone remapping:
+        #   Stock Joiner = nn.Sequential([Backbone, PositionEmbedding])
+        #     → backbone.0.encoder.*, backbone.0.projector.*
+        #   Our DualStreamJoiner stores:
+        #     .backbone = DualStreamRFDETRBackbone (has .encoder, .projector from stock)
+        #     .position_embedding = PositionEmbedding
+        #   So: backbone.0.X → backbone.backbone.X  (encoder/projector are direct attrs)
+        #       backbone.1.X → backbone.position_embedding.X
+        remapped = {}
+        for k, v in state.items():
+            new_key = 'lwdetr.' + k
+            if k.startswith('backbone.0.'):
+                suffix = k[len('backbone.0.'):]
+                new_key = 'lwdetr.backbone.backbone.' + suffix
+            elif k.startswith('backbone.1.'):
+                suffix = k[len('backbone.1.'):]
+                new_key = 'lwdetr.backbone.position_embedding.' + suffix
+            remapped[new_key] = v
+        state = remapped
+
+        # Handle num_classes mismatch: COCO pretrained has 81 classes (80+1),
+        # our model has (num_classes+1).  Skip mismatched classification heads.
+        model_state = model.state_dict()
+        keys_to_skip = []
+        for k in state:
+            if k in model_state and state[k].shape != model_state[k].shape:
+                keys_to_skip.append(k)
+        for k in keys_to_skip:
+            del state[k]
+        if keys_to_skip:
+            print(f'[dual_stream_rfdetr] Skipped {len(keys_to_skip)} shape-mismatched keys '
+                  f'(num_classes change): {keys_to_skip}')
+
+        # Load into FULL model; depth/DAAF keys won't exist → strict=False
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        # Filter out expected missing keys (depth_encoder, daaf, depth_generator, boundary, criterion)
+        expected_missing_prefixes = (
+            'lwdetr.backbone.backbone.depth_encoder',
+            'lwdetr.backbone.backbone.daaf',
+            'lwdetr.segmentation_head',   # not in detection-only checkpoint
+            'depth_generator',
+            'boundary_loss_fn',
+            'criterion',
+        )
+        truly_missing = [k for k in missing
+                         if not any(k.startswith(p) for p in expected_missing_prefixes)]
+        print(f'[dual_stream_rfdetr] Loaded pretrained weights from {pretrain_weights}: '
+              f'{len(missing)} missing ({len(truly_missing)} unexpected), '
+              f'{len(unexpected)} unexpected keys')
+        if truly_missing:
+            print(f'[dual_stream_rfdetr] WARNING: unexpectedly missing keys: '
+                  f'{truly_missing[:10]}')
+    else:
+        print(f'[dual_stream_rfdetr] WARNING: No pretrained weights loaded! '
+              f'Training from scratch — convergence will be very slow.')
 
     return model
