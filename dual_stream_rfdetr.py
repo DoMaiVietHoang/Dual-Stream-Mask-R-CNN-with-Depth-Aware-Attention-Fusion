@@ -483,7 +483,7 @@ def build_dual_stream_rfdetr(
     resolution: int = 1024,
     segmentation: bool = True,
     device: str = 'cuda',
-    mask_downsample_ratio: int = 8,
+    mask_downsample_ratio: int = 4,
 ) -> DualStreamLWDETR:
     """
     Build the Dual-Stream RF-DETR model.

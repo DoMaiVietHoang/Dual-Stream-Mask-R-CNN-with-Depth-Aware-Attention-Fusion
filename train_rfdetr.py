@@ -518,8 +518,8 @@ if __name__ == '__main__':
                    help='Path to RF-DETR pretrained .pth (None = train from scratch)')
     p.add_argument('--freeze-encoder', action='store_true', default=False)
     p.add_argument('--lambda-boundary', type=float, default=0.5)
-    p.add_argument('--mask-downsample-ratio', type=int, default=8,
-                   help='Mask spatial downsample (4=H/4×W/4, 8=H/8×W/8). Higher=less memory.')
+    p.add_argument('--mask-downsample-ratio', type=int, default=4,
+                   help='Mask spatial downsample (4=H/4×W/4, 8=H/8×W/8). Lower=better masks.')
 
     # Training
     p.add_argument('--batch-size',        type=int,   default=2)
@@ -528,8 +528,8 @@ if __name__ == '__main__':
     p.add_argument('--learning-rate',     type=float, default=1e-4)
     p.add_argument('--weight-decay',      type=float, default=1e-4)
     p.add_argument('--num-workers',       type=int,   default=4)
-    p.add_argument('--image-size',        type=int,   default=640,
-                   help='Input resolution. 640 fits 16GB VRAM; 1024 needs 24GB+ or grad-ckpt.')
+    p.add_argument('--image-size',        type=int,   default=1024,
+                   help='Input resolution. Higher=better masks. 1024 fits 16GB with AMP+grad-ckpt.')
     p.add_argument('--accumulation-steps',type=int,   default=4)
     p.add_argument('--early-stopping-patience', type=int, default=10)
 
