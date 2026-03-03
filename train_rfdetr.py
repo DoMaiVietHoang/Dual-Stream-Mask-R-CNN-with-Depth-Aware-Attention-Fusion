@@ -515,7 +515,8 @@ if __name__ == '__main__':
                    choices=['nano','small','medium','base','large'])
     p.add_argument('--num-classes',  type=int, default=1)
     p.add_argument('--pretrain-weights', default=None,
-                   help='Path to RF-DETR pretrained .pth (None = train from scratch)')
+                   help='Path to RF-DETR pretrained .pth (None = auto-download COCO weights, '
+                        '"none" = train from scratch)')
     p.add_argument('--freeze-encoder', action='store_true', default=False)
     p.add_argument('--lambda-boundary', type=float, default=0.5)
     p.add_argument('--mask-downsample-ratio', type=int, default=4,

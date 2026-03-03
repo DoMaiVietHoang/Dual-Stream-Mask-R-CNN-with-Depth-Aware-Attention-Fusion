@@ -514,14 +514,15 @@ def build_dual_stream_rfdetr(
     # Compute correct positional_encoding_size for the given resolution.
     # Each variant has a fixed patch_size; pos encoding size = resolution / patch_size.
     _tmp = cfg_cls(num_classes=num_classes, device=device,
-                   segmentation_head=segmentation, pretrain_weights=pretrain_weights)
+                   segmentation_head=segmentation)
     pos_enc_size = resolution // _tmp.patch_size
+    # Do NOT pass pretrain_weights to cfg — let it keep its class default
+    # (e.g. "rf-detr-nano.pth") so we can auto-download later.
     cfg = cfg_cls(
         num_classes=num_classes,
         resolution=resolution,
         device=device,
         segmentation_head=segmentation,
-        pretrain_weights=pretrain_weights,
         positional_encoding_size=pos_enc_size,
     )
 
@@ -655,16 +656,24 @@ def build_dual_stream_rfdetr(
     # ── 7. Load pretrained RF-DETR weights ────────────────────────────────
     # Auto-download if pretrain_weights is a known model name (e.g. "rf-detr-nano.pth")
     # If user didn't specify, use the variant's default COCO-pretrained weights.
-    if pretrain_weights is None:
+    if pretrain_weights is not None and pretrain_weights.lower() == 'none':
+        pretrain_weights = None   # explicit skip
+    elif pretrain_weights is None:
         pretrain_weights = cfg.pretrain_weights   # e.g. "rf-detr-nano.pth"
 
     if pretrain_weights:
         # Download if not already on disk
         if not os.path.isfile(pretrain_weights):
+            print(f'[dual_stream_rfdetr] Downloading pretrained weights: {pretrain_weights}')
             try:
                 download_pretrain_weights(pretrain_weights)
+                print(f'[dual_stream_rfdetr] Download complete. '
+                      f'File exists: {os.path.isfile(pretrain_weights)}, '
+                      f'CWD: {os.getcwd()}')
             except Exception as e:
+                import traceback
                 print(f'[dual_stream_rfdetr] Could not download {pretrain_weights}: {e}')
+                traceback.print_exc()
                 pretrain_weights = None
 
     if pretrain_weights and os.path.isfile(pretrain_weights):
