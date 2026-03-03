@@ -510,12 +510,18 @@ def build_dual_stream_rfdetr(
         f"variant must be one of {list(_VARIANT_CONFIGS)}"
 
     cfg_cls = _VARIANT_CONFIGS[variant]
+    # Compute correct positional_encoding_size for the given resolution.
+    # Each variant has a fixed patch_size; pos encoding size = resolution / patch_size.
+    _tmp = cfg_cls(num_classes=num_classes, device=device,
+                   segmentation_head=segmentation, pretrain_weights=pretrain_weights)
+    pos_enc_size = resolution // _tmp.patch_size
     cfg = cfg_cls(
         num_classes=num_classes,
         resolution=resolution,
         device=device,
         segmentation_head=segmentation,
         pretrain_weights=pretrain_weights,
+        positional_encoding_size=pos_enc_size,
     )
 
     # ── 1. Build stock RF-DETR backbone (DINOv2 + projector) ─────────────

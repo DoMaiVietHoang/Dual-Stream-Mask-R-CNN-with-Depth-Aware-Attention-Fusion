@@ -214,7 +214,8 @@ def evaluate(
             depth_maps = torch.stack([t['depth'] for t in targets]).to(device)
 
         try:
-            results = model(images, depth_maps=depth_maps)
+            with torch.cuda.amp.autocast(enabled=True):
+                results = model(images, depth_maps=depth_maps)
         except Exception as e:
             if logger:
                 logger.error(f'Eval batch {batch_idx} error: {e}')
@@ -223,6 +224,13 @@ def evaluate(
 
         # PostProcess output: list of {'scores','labels','boxes','masks'}
         for i, (res, target) in enumerate(zip(results, targets)):
+            # Filter out background class predictions.
+            # RF-DETR uses num_classes+1; the LAST class is background.
+            # With num_classes=1: class 0 = tree, class 1 = background.
+            fg_mask = res['labels'] < model.num_classes   # keep only foreground
+            res = {k: v[fg_mask] if isinstance(v, torch.Tensor) and v.shape[0] == fg_mask.shape[0] else v
+                   for k, v in res.items()}
+
             # ── Mask AP ────────────────────────────────────────────────────
             gt_masks_raw = target.get('masks', None)
             if (gt_masks_raw is not None and isinstance(gt_masks_raw, torch.Tensor)
