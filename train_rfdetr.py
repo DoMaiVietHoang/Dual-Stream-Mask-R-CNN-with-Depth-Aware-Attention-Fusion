@@ -245,11 +245,19 @@ def evaluate(
             pred_masks_raw = res.get('masks', None)
             pred_scores = res['scores'].cpu()
 
+            # Pre-filter low-confidence predictions to reduce noise in AP
+            # and avoid computing expensive mask IoU for hopeless candidates.
+            # Use a very low threshold (0.05) to keep enough for AP curve.
+            ap_score_thresh = 0.05
+            keep = pred_scores > ap_score_thresh
+            pred_scores = pred_scores[keep]
+
             if pred_masks_raw is not None and len(pred_masks_raw) > 0:
+                pred_masks_raw = pred_masks_raw[keep.to(pred_masks_raw.device)]
                 # masks from PostProcess: [K, 1, H, W] bool
                 pm_float = pred_masks_raw[:, 0].float().cpu()
 
-                if num_gt > 0:
+                if num_gt > 0 and len(pm_float) > 0:
                     gt_h, gt_w = gt_masks.shape[-2], gt_masks.shape[-1]
                     pr_h, pr_w = pm_float.shape[-2], pm_float.shape[-1]
                     if (pr_h, pr_w) != (gt_h, gt_w):
@@ -258,7 +266,7 @@ def evaluate(
                             mode='bilinear', align_corners=False
                         ).squeeze(0)
 
-                pred_masks = pm_float > 0.5
+                pred_masks = pm_float > 0.5 if len(pm_float) > 0 else torch.zeros((0,), dtype=torch.bool)
                 del pm_float
             else:
                 pred_masks = torch.zeros((0,), dtype=torch.bool)
@@ -277,7 +285,7 @@ def evaluate(
 
             # ── Box P/R/F1 ─────────────────────────────────────────────────
             gt_boxes = target['boxes'].cpu()   # xyxy absolute
-            pred_boxes = res['boxes'].cpu()    # xyxy absolute from PostProcess
+            pred_boxes = res['boxes'].cpu()[keep]   # same filter as masks
             filt = pred_scores > score_thresh
             pred_boxes_filt = pred_boxes[filt]
 
