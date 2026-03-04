@@ -317,8 +317,16 @@ def evaluate(
             (rec['iou_rows'].max().item() for rec in ap_records if rec['iou_rows'].numel() > 0),
             default=0.0
         )
+        # Score distribution for debugging
+        all_sc = torch.cat([rec['scores'] for rec in ap_records if len(rec['scores']) > 0])
+        if len(all_sc) > 0:
+            sc_stats = (f'scores: min={all_sc.min():.4f}, median={all_sc.median():.4f}, '
+                        f'max={all_sc.max():.4f}, >0.3={int((all_sc>0.3).sum())}, '
+                        f'>0.5={int((all_sc>0.5).sum())}')
+        else:
+            sc_stats = 'no predictions'
         logger.info(f'[eval] {total_gt_masks} GT masks, {total_preds} preds, '
-                    f'max_mask_IoU={iou_max:.4f}')
+                    f'max_mask_IoU={iou_max:.4f}, {sc_stats}')
 
     precision = total_tp / (total_tp + total_fp + 1e-8)
     recall    = total_tp / (total_tp + total_fn + 1e-8)

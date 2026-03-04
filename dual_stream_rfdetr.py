@@ -330,7 +330,77 @@ class DualStreamLWDETR(nn.Module):
         target_sizes = torch.tensor(
             [images.shape[-2:]], device=images.device
         ).repeat(images.shape[0], 1)
-        return self.postprocessor(out, target_sizes)
+        return self._postprocess_single_class(out, target_sizes)
+
+    # ------------------------------------------------------------------
+    # Inference: single-class-aware postprocessing
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def _postprocess_single_class(self, outputs, target_sizes):
+        """
+        Custom postprocessing for single/few-class instance segmentation.
+
+        The stock PostProcess flattens [B, N_q, C] → [B, N_q*C] and takes top-K,
+        which with C=2 (1 fg + 1 bg) causes:
+          - Each query appears up to 2× (once per class) → duplicate masks
+          - Background entries pollute top-K → wasted capacity
+          - Scores not meaningful for ranking → AP stays near 0
+
+        Fix: Use only the FOREGROUND class logit (class 0) per query as the
+        confidence score.  Each of the N_q queries produces exactly one detection
+        candidate, scored by sigmoid(logit_class0).  This gives N_q unique
+        detections ranked by actual object confidence.
+        """
+        out_logits = outputs["pred_logits"]   # [B, N_q, num_classes]
+        out_bbox   = outputs["pred_boxes"]    # [B, N_q, 4]
+        out_masks  = outputs.get("pred_masks", None)  # [B, N_q, Hm, Wm] or None
+
+        B, N_q = out_logits.shape[:2]
+
+        # Take foreground (class 0) sigmoid as confidence score for each query
+        fg_scores = out_logits[:, :, 0].sigmoid()   # [B, N_q]
+
+        # Sort by score descending, keep top num_select (default 300 = all queries)
+        num_select = min(self.postprocessor.num_select, N_q)
+        scores, sort_idx = fg_scores.topk(num_select, dim=1)   # [B, K]
+
+        # Gather boxes — convert cxcywh → xyxy inline
+        cx, cy, w, h = out_bbox.unbind(-1)
+        boxes = torch.stack([cx - w/2, cy - h/2, cx + w/2, cy + h/2], dim=-1)
+        boxes = torch.gather(boxes, 1, sort_idx.unsqueeze(-1).expand(-1, -1, 4))
+
+        # Scale to absolute coordinates
+        img_h, img_w = target_sizes.unbind(1)
+        scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=1)
+        boxes = boxes * scale_fct[:, None, :]
+
+        # All foreground → label 0
+        labels = torch.zeros_like(sort_idx)
+
+        results = []
+        for i in range(B):
+            res_i = {
+                "scores": scores[i],
+                "labels": labels[i],
+                "boxes" : boxes[i],
+            }
+            if out_masks is not None:
+                masks_i = torch.gather(
+                    out_masks[i], 0,
+                    sort_idx[i].unsqueeze(-1).unsqueeze(-1).expand(
+                        -1, out_masks.shape[-2], out_masks.shape[-1]
+                    ),
+                )   # [K, Hm, Wm]
+                h, w = target_sizes[i].tolist()
+                masks_i = F.interpolate(
+                    masks_i.unsqueeze(1), size=(int(h), int(w)),
+                    mode="bilinear", align_corners=False,
+                )   # [K, 1, H, W]
+                res_i["masks"] = masks_i > 0.0
+            results.append(res_i)
+
+        return results
 
     # ------------------------------------------------------------------
     # Mask loss helper  (CE + Dice on matched pairs, last decoder layer only)
@@ -677,7 +747,7 @@ def build_dual_stream_rfdetr(
                 pretrain_weights = None
 
     if pretrain_weights and os.path.isfile(pretrain_weights):
-        state = torch.load(pretrain_weights, map_location='cpu')
+        state = torch.load(pretrain_weights, map_location='cpu', weights_only=False)
         if 'model' in state:
             state = state['model']
 
@@ -729,8 +799,11 @@ def build_dual_stream_rfdetr(
             'boundary_loss_fn',
             'criterion',
         )
+        # Also treat shape-skipped keys as expected missing
+        skipped_set = set(keys_to_skip)
         truly_missing = [k for k in missing
-                         if not any(k.startswith(p) for p in expected_missing_prefixes)]
+                         if not any(k.startswith(p) for p in expected_missing_prefixes)
+                         and k not in skipped_set]
         print(f'[dual_stream_rfdetr] Loaded pretrained weights from {pretrain_weights}: '
               f'{len(missing)} missing ({len(truly_missing)} unexpected), '
               f'{len(unexpected)} unexpected keys')
