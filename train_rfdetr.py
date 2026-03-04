@@ -326,7 +326,8 @@ def evaluate(
             default=0.0
         )
         # Score distribution for debugging
-        all_sc = torch.cat([rec['scores'] for rec in ap_records if len(rec['scores']) > 0])
+        sc_list = [rec['scores'] for rec in ap_records if len(rec['scores']) > 0]
+        all_sc = torch.cat(sc_list) if sc_list else torch.tensor([])
         if len(all_sc) > 0:
             sc_stats = (f'scores: min={all_sc.min():.4f}, median={all_sc.median():.4f}, '
                         f'max={all_sc.max():.4f}, >0.3={int((all_sc>0.3).sum())}, '
