@@ -493,6 +493,16 @@ def main(args):
 
         scheduler.step()
 
+        # Log DAAF gate values to monitor depth fusion strength
+        gate_vals = []
+        for name, param in model.named_parameters():
+            if name.endswith('.gate') and 'daaf' in name:
+                gate_vals.append(f'{name.split(".")[-3]}={torch.tanh(param).item():.4f}')
+        if gate_vals:
+            logger.info(f'Epoch {epoch} DAAF gates (tanh): {", ".join(gate_vals)}')
+            for i, gv in enumerate(gate_vals):
+                writer.add_scalar(f'train/daaf_gate_{i}', float(gv.split("=")[1]), epoch)
+
         if (epoch + 1) % args.eval_interval == 0:
             metrics = evaluate(
                 model, val_loader, device, logger=logger,
