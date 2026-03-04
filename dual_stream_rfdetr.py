@@ -397,7 +397,7 @@ class DualStreamLWDETR(nn.Module):
                     masks_i.unsqueeze(1), size=(int(h), int(w)),
                     mode="bilinear", align_corners=False,
                 )   # [K, 1, H, W]
-                res_i["masks"] = masks_i > 0.0
+                res_i["masks"] = masks_i > 0.5
             results.append(res_i)
 
         return results
